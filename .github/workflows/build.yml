@@ -1,0 +1,78 @@
+name: Build OPSINator
+
+# Runs automatically on every push to main, and can also be triggered
+# manually from the Actions tab on GitHub (the workflow_dispatch line).
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  # ============================================================
+  # OPSINatorLite - OPSIN only, no heavy dependencies.
+  # Builds on all three OSes natively, in parallel.
+  # ============================================================
+  build-lite:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # tkinter is not always preinstalled on Linux runners by default.
+      - name: Install tkinter (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - name: Install build tools
+        run: pip install nuitka
+
+      - name: Build OPSINatorLite (onedir)
+        run: |
+          python -m nuitka --standalone --enable-plugin=tk-inter --output-dir=dist opsinator_light.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OPSINatorLite-${{ matrix.os }}
+          path: dist/opsinator_light.dist
+
+  # ============================================================
+  # OPSINatorFull - OPSIN + DECIMER Image Transformer + RDKit.
+  # Heavier, slower build (TensorFlow), same three-OS matrix.
+  # ============================================================
+  build-full:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install tkinter (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+      - name: Install project dependencies
+        run: pip install decimer rdkit nuitka
+
+      - name: Build OPSINatorFull (onedir)
+        run: |
+          python -m nuitka --standalone --enable-plugin=tk-inter --output-dir=dist opsinator.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OPSINatorFull-${{ matrix.os }}
+          path: dist/opsinator.dist
