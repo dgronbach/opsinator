@@ -9,41 +9,6 @@ on:
 
 jobs:
   # ============================================================
-  # OPSINatorLite - OPSIN only, no heavy dependencies.
-  # Builds on all three OSes natively, in parallel.
-  # ============================================================
-  build-lite:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      # tkinter is not always preinstalled on Linux runners by default.
-      - name: Install tkinter (Linux only)
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y python3-tk
-
-      - name: Install build tools
-        run: pip install nuitka
-
-      - name: Build OPSINatorLite (onedir)
-        run: |
-          python -m nuitka --standalone --assume-yes-for-downloads --enable-plugin=tk-inter --output-dir=dist opsinator_light.py
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: OPSINatorLite-${{ matrix.os }}
-          path: dist/opsinator_light.dist
-
-  # ============================================================
   # OPSINatorFull - OPSIN + DECIMER Image Transformer + RDKit.
   # Heavier, slower build (TensorFlow), same three-OS matrix.
   # ============================================================
