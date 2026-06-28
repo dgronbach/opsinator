@@ -1,43 +1,58 @@
 name: Build OPSINator
 
-# Runs automatically on every push to main, and can also be triggered
-# manually from the Actions tab on GitHub (the workflow_dispatch line).
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
 
 jobs:
-  # ============================================================
-  # OPSINatorFull - OPSIN + DECIMER Image Transformer + RDKit.
-  # Heavier, slower build (TensorFlow), same three-OS matrix.
-  # ============================================================
-  build-full:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+  # Windows: both binaries via Nuitka (AV false-positive avoidance).
+  # The main app build is now fast (no TensorFlow in it at all).
+  # The engine build is still the slow one - that's isolated and expected.
+  build-windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Install project dependencies
+        run: pip install decimer rdkit nuitka
+      - name: Build main app (opsinator)
+        run: python -m nuitka --standalone --assume-yes-for-downloads --enable-plugin=tk-inter --output-dir=dist opsinator.py
+      - name: Build DECIMER engine (opsinator_engine)
+        run: python -m nuitka --standalone --assume-yes-for-downloads --output-dir=dist opsinator_engine.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OPSINatorFull-windows-latest
+          path: |
+            dist/opsinator.dist
+            dist/opsinator_engine.dist
 
+  # macOS and Linux: both binaries via PyInstaller (fast, proven today).
+  build-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
       - name: Install tkinter (Linux only)
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y python3-tk
-
       - name: Install project dependencies
-        run: pip install decimer rdkit nuitka
-
-      - name: Build OPSINatorFull (onedir)
-        run: |
-          python -m nuitka --standalone --assume-yes-for-downloads --enable-plugin=tk-inter --output-dir=dist opsinator.py
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        run: pip install decimer rdkit pyinstaller
+      - name: Build main app (opsinator)
+        run: pyinstaller --onedir --name opsinator opsinator.py
+      - name: Build DECIMER engine (opsinator_engine)
+        run: pyinstaller --onedir --name opsinator_engine opsinator_engine.py
+      - uses: actions/upload-artifact@v4
         with:
           name: OPSINatorFull-${{ matrix.os }}
-          path: dist/opsinator.dist
+          path: |
+            dist/opsinator
+            dist/opsinator_engine

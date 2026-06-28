@@ -72,6 +72,7 @@ import json                 # Converting between Python dictionaries and JSON te
 import math                 # Trigonometry functions (sin, cos) used by the animation
 import os                   # Talking to the operating system: file paths, folders, etc.
 import queue                # A thread-safe "to-do list" used to pass messages between threads
+import subprocess           # Launching the separate DECIMER engine program
 import sys                  # Information about how this program is being run
 import threading            # Lets us run code in the background, without freezing the GUI
 import tkinter as tk        # tkinter is Python's built-in GUI (graphical window) toolkit
@@ -685,62 +686,94 @@ class ScientistAnimation:
 # ============================================================
 
 class DecimerEngine:
-    """A small wrapper around DECIMER that delays ("lazily loads") the
-    actual import until it's genuinely needed.
+    """Talks to a SEPARATE program (the 'OPSINator DECIMER Engine') rather
+    than importing DECIMER directly into this process.
 
-    Why bother with this instead of a normal `import DECIMER` at the top
-    of the file? Because importing DECIMER pulls in TensorFlow (hundreds
-    of MB) and may trigger a large one-time model download. If someone
-    only ever uses the Name -> Structure tab, we don't want to force that
-    cost on them just for opening the app.
+    Why: DECIMER pulls in TensorFlow, which is large and slow to load -
+    testing showed this can meaningfully delay a window even appearing,
+    because the cost is paid the moment it's imported. By running it as
+    a separate executable instead, that cost is paid in a short-lived
+    helper process, on demand, once per image - never blocking this
+    app's own startup or its window from appearing immediately.
+
+    This mirrors how the Name -> Structure tab already treats OPSIN: as
+    an external thing this app calls out to, not something baked into
+    its own process.
     """
 
     def __init__(self):
-        self._predict_fn = None   # will hold DECIMER's predict_SMILES function, once loaded
-        self._lock = threading.Lock()
-        # CONCEPT: a threading.Lock() is a tool for making sure that, if
-        # two background threads both try to load DECIMER at the "same"
-        # moment, only one of them actually does the work - the other
-        # waits politely instead of triggering two downloads at once.
         self.load_error = None
+        self._engine_path = self._find_engine_executable()
+        if self._engine_path is None:
+            self.load_error = (
+                "Could not find the OPSINator DECIMER Engine executable. "
+                "It should be installed alongside this app."
+            )
+
+    def _find_engine_executable(self):
+        """Looks for the engine executable in the same folder as this
+        app. Returns its full path, or None if it isn't there.
+
+        CONCEPT: sys.executable is the path to the currently running
+        program when this app itself has been frozen into an exe by
+        PyInstaller/Nuitka. os.path.dirname() then gives us the folder
+        it lives in, so we can look for a sibling file right next to it.
+        """
+        if getattr(sys, "frozen", False):
+            app_dir = os.path.dirname(sys.executable)
+        else:
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+
+        candidates = [
+            os.path.join(app_dir, "opsinator_engine.exe"),   # Windows
+            os.path.join(app_dir, "opsinator_engine"),         # Linux / macOS
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+        return None
 
     def is_loaded(self):
-        return self._predict_fn is not None
+        # There's no "loading" step anymore in this process - the engine
+        # is a separate program we just call each time. We report
+        # "loaded" as soon as we've confirmed the executable exists, so
+        # the rest of the app's logic (which expects this method) still
+        # behaves sensibly.
+        return self._engine_path is not None and self.load_error is None
 
     def ensure_loaded(self, status_callback=None):
-        """Loads DECIMER if it hasn't been loaded yet. Safe to call many
-        times - after the first successful (or failed) attempt, later
-        calls do nothing.
-
-        status_callback, if provided, is a function we call with a short
-        text message, so the calling code can show "please wait" text in
-        the GUI while this potentially slow step runs.
-        """
-        # CONCEPT: `with self._lock:` means "only one thread at a time
-        # gets past this point." Any other thread that reaches this same
-        # line while we're inside the block will simply wait until we're
-        # done, then proceed in turn.
-        with self._lock:
-            if self._predict_fn is not None or self.load_error is not None:
-                return  # already attempted (successfully or not) - nothing to do
-            try:
-                if status_callback:
-                    status_callback("Configuring image recognition engine "
-                                     "(first run only) - please wait...")
-                # This import line is the expensive part - it can trigger
-                # TensorFlow loading and, on a brand-new machine, a large
-                # model download. It only happens once per running app.
-                from DECIMER import predict_SMILES
-                self._predict_fn = predict_SMILES
-            except Exception as e:
-                self.load_error = str(e)
+        # Nothing to lazily import anymore - the only thing to check is
+        # whether the engine executable was found, which already
+        # happened in __init__. This method still exists so the calling
+        # code (written for the old in-process design) doesn't need to
+        # change at all.
+        if status_callback and self.is_loaded():
+            status_callback("Ready.")
 
     def predict(self, image_path: str) -> str:
-        """Runs the actual image recognition and returns a SMILES string.
-        Raises RuntimeError if ensure_loaded() hasn't succeeded yet."""
-        if self._predict_fn is None:
-            raise RuntimeError(self.load_error or "DECIMER not loaded")
-        return self._predict_fn(image_path)
+        """Runs image recognition by launching the separate engine
+        program as a subprocess and reading its output, instead of
+        calling a function inside this process."""
+        if self._engine_path is None:
+            raise RuntimeError(self.load_error or "DECIMER engine not found")
+
+        # CONCEPT: subprocess.run() starts another program, waits for it
+        # to finish, and hands back what it printed. capture_output=True
+        # captures both its normal output (stdout) and any error
+        # messages (stderr) instead of letting them print to this app's
+        # own console.
+        result = subprocess.run(
+            [self._engine_path, image_path],
+            capture_output=True,
+            text=True,
+            timeout=300,  # generous ceiling - first-run model download can be slow
+        )
+
+        if result.returncode != 0:
+            error_text = result.stderr.strip() or "Unknown error from DECIMER engine"
+            raise RuntimeError(error_text)
+
+        return result.stdout.strip()
 
 
 def check_decimer_update() -> dict:
