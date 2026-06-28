@@ -46,10 +46,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y python3-tk
       - name: Install project dependencies
         run: pip install decimer rdkit pyinstaller
-      - name: Build main app (opsinator)
-        run: pyinstaller --onedir --name opsinator opsinator.py
-      - name: Build DECIMER engine (opsinator_engine)
-        run: pyinstaller --onedir --name opsinator_engine opsinator_engine.py
+      - name: Build both apps with shared dependencies (MERGE)
+        run: pyinstaller opsinator.spec
       - uses: actions/upload-artifact@v4
         with:
           name: OPSINatorFull-${{ matrix.os }}
