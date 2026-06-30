@@ -67,18 +67,32 @@ you already know the idea.
 # --------------------------------------------------------------------------
 
 import csv                  # Reading and writing .csv (spreadsheet) files
-import importlib.metadata   # Lets us ask "what version of package X is installed?"
+import importlib.metadata   # Checking what's installed, and refreshing that after a pip install
+import re                   # Pattern matching, used to pull "42%" out of status text
+import shutil                # Deleting temporary folders (PDF scan scratch space)
 import json                 # Converting between Python dictionaries and JSON text
 import math                 # Trigonometry functions (sin, cos) used by the animation
 import os                   # Talking to the operating system: file paths, folders, etc.
 import queue                # A thread-safe "to-do list" used to pass messages between threads
-import subprocess           # Launching the separate DECIMER engine program
+import subprocess           # Launching the separate DECIMER and Segmentation engine programs
 import sys                  # Information about how this program is being run
+import tempfile             # Creating scratch folders for rendered PDF pages and crops
 import threading            # Lets us run code in the background, without freezing the GUI
 import tkinter as tk        # tkinter is Python's built-in GUI (graphical window) toolkit
 import urllib.error         # Specific error types that can happen when fetching a URL
 import urllib.parse         # Helpers for safely building URLs out of text
 import urllib.request       # Lets Python make HTTP requests to web servers
+
+# tkinterdnd2 adds drag-and-drop support, which plain tkinter doesn't
+# have at all. It's an optional third-party package - if it isn't
+# installed for some reason, the app still works fine; the drop zone
+# just won't accept drags, and the Choose Image/Choose PDF buttons
+# remain the way to get a file in either way.
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    _DND_AVAILABLE = True
+except ImportError:
+    _DND_AVAILABLE = False
 from tkinter import filedialog, messagebox, ttk
 # filedialog = "Open file" / "Save file" pop-up windows
 # messagebox = simple pop-up boxes like "Are you sure?" or "Error!"
@@ -313,6 +327,73 @@ def is_license_accepted():
     return os.path.isfile(LICENSE_FLAG_PATH)
 
 
+# A separate flag, same pattern as the license one, for whether the user
+# has opted in to DECIMER's large download. Kept distinct from license
+# acceptance on purpose - accepting the license is not the same thing as
+# agreeing to a multi-GB download, and shouldn't be bundled together.
+DECIMER_ENABLED_FLAG_PATH = os.path.join(LICENSE_DIR, "decimer_enabled.flag")
+
+
+def is_decimer_enabled():
+    return os.path.isfile(DECIMER_ENABLED_FLAG_PATH)
+
+
+def _decimer_components_present() -> bool:
+    """Returns True only when both DECIMER model directories contain a
+    saved_model.pb, meaning the download completed successfully.
+    Mirrors the same path logic used by opsinator_engine.py so the check
+    reflects the actual on-disk state, not just whether a button was clicked.
+    """
+    base = os.environ.get("PYSTOW_HOME") or os.path.join(os.path.expanduser("~"), ".data")
+    model_base = os.path.join(base, "DECIMER-V2")
+    for model_name in ("DECIMER", "DECIMER_HandDrawn"):
+        pb = os.path.join(model_base, f"{model_name}_model", "saved_model.pb")
+        if not os.path.isfile(pb):
+            return False
+    return True
+
+
+def mark_decimer_enabled():
+    try:
+        os.makedirs(LICENSE_DIR, exist_ok=True)
+        with open(DECIMER_ENABLED_FLAG_PATH, "w", encoding="utf-8") as f:
+            f.write("enabled")
+    except Exception:
+        pass
+
+
+def mark_decimer_disabled():
+    try:
+        if os.path.isfile(DECIMER_ENABLED_FLAG_PATH):
+            os.remove(DECIMER_ENABLED_FLAG_PATH)
+    except Exception:
+        pass
+
+
+# A small settings file for things worth remembering between runs that
+# AREN'T a one-time yes/no choice (like the flags above) - right now,
+# just the last folder the user picked a file from or saved one to.
+SETTINGS_PATH = os.path.join(LICENSE_DIR, "settings.json")
+
+
+def load_settings() -> dict:
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_settings(settings: dict):
+    try:
+        os.makedirs(LICENSE_DIR, exist_ok=True)
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(settings, f)
+    except Exception:
+        pass  # not critical - worst case, it just doesn't remember next time
+
+
+
 def mark_license_accepted():
     """Writes a small marker file to remember that the user has accepted
     the license, so we never show the dialog again on this machine.
@@ -361,13 +442,24 @@ def show_license_dialog(root, on_accept, on_decline):
     dialog.title("License & Attribution - OPSINator")
     dialog.geometry("620x560")   # width x height, in pixels
 
-    # `transient(root)` tells the operating system "this window belongs
-    # to root" (so it minimizes/restores together with it, for example).
-    dialog.transient(root)
+    # NOTE: we deliberately do NOT call dialog.transient(root) here.
+    # root is withdrawn (hidden) at this point in the program, and on
+    # some Linux window managers, marking a window "transient for" a
+    # parent that was never actually shown can prevent the window from
+    # displaying at all, even though Tk reports no error.
 
     # `grab_set()` makes this dialog "modal" - the user can't click on
     # the main window behind it until this dialog is closed.
     dialog.grab_set()
+
+    # Force this window to actually appear on top and take focus,
+    # rather than relying on the window manager's default behavior.
+    dialog.update_idletasks()
+    dialog.deiconify()
+    dialog.lift()
+    dialog.attributes("-topmost", True)
+    dialog.after(200, lambda: dialog.attributes("-topmost", False))
+    dialog.focus_force()
 
     # If the user clicks the window's [X] close button, treat that the
     # same as clicking "Decline and Exit".
@@ -450,6 +542,334 @@ PYPI_DECIMER_URL = "https://pypi.org/pypi/decimer/json"  # used for the update c
 
 
 # ============================================================
+# Patent activity table extraction (name -> OPSIN pipeline)
+# ============================================================
+
+# --- Extensible name-cleaning pipeline ---
+# Each rule is a module-level function: (name: str) -> (cleaned: str, meta: dict)
+# meta keys: salt_form, stereo_note, handling_notes (list).
+# Rules are applied in order; each receives the output of the previous rule.
+# To add a new rule: define a function here and append it to CLEANING_PIPELINE.
+
+def _rule_strip_diast_annotations(name):
+    meta = {}
+    m = re.search(r'\b(DIAST-\d+)\b', name, re.IGNORECASE)
+    if m:
+        meta['stereo_note'] = m.group(1)
+    name = re.sub(r',?\s*\[From DIAST-\d+ of precursor[^\]]*\]', '', name, flags=re.IGNORECASE)
+    name = re.sub(r',?\s*DIAST-\d+', '', name).rstrip(',').strip()
+    return name, meta
+
+def _rule_strip_footnote_refs(name):
+    # Complete reference: "(see footnote X in Table Y)" — strip exactly
+    name = re.sub(r',?\s*\(see footnote \d+ in Table \d+[)\]]', '', name)
+    # Incomplete/embedded: closing "Y)" was in a separately-filtered PDF fragment,
+    # or the footnote text has embedded garbage following it.  Strip everything from
+    # "(see footnote" to the end of the string — this marker NEVER appears inside a
+    # valid IUPAC name and always terminates the cell content.
+    name = re.sub(r',?\s*\(see footnote\b.*$', '', name, flags=re.DOTALL).rstrip(',').strip()
+    return name, {}
+
+def _rule_strip_trailing_garbage(name):
+    """Truncate at table-footnote / patent-claims markers that may bleed in."""
+    m = re.search(r'\s*[,;]?\s*1\.\s+Values represent\b', name, re.IGNORECASE)
+    if m:
+        name = name[:m.start()].rstrip(',').strip()
+    m = re.search(r'\bCLAIMS\b|\bWHAT IS CLAIMED IS\b', name)
+    if m:
+        name = name[:m.start()].rstrip(',').strip()
+    return name, {}
+
+def _rule_strip_salt_forms(name):
+    """Strip trailing or leading salt descriptors; record them in metadata."""
+    meta = {}
+    m = re.search(
+        r',?\s*((?:trifluoroacetate|hydrochloride|formate|acetate|mesylate|tosylate)'
+        r'(?:\s+salt)?)\s*$',
+        name, re.IGNORECASE,
+    )
+    if m:
+        meta['salt_form'] = m.group(1).strip()
+        name = name[:m.start()].rstrip(',').strip()
+    elif re.match(r'^ammonium\s+', name, re.IGNORECASE):
+        meta['salt_form'] = 'ammonium'
+        name = re.sub(r'^ammonium\s+', '', name, flags=re.IGNORECASE)
+        name = re.sub(r'\bcarboxylate\b', 'carboxylic acid', name)
+        name = re.sub(r'\bbenzoate\b',    'benzoic acid',    name)
+    return name, meta
+
+def _rule_normalize_n_locants(name):
+    """Fix OCR-mangled superscript N-locants: JVn → Nn (e.g. JV2 → N2)."""
+    meta = {}
+    if re.search(r'\bJV\d+\b', name):
+        meta['handling_notes'] = ['N-locant OCR corrected (JVn→Nn)']
+        name = re.sub(r'\bJV(\d+)\b', r'N\1', name)
+    return name, meta
+
+def _rule_fix_spacing_artifacts(name):
+    """Collapse PDF text-extraction spacing artifacts in chemical names."""
+    name = re.sub(r'-\s+(?=[a-zA-Z0-9({[])', '-', name)                    # propan-2- yl → propan-2-yl
+    name = re.sub(r'\bd\s+icarboxamide\b', 'dicarboxamide', name)           # d icarboxamide → dicarboxamide
+    name = re.sub(r'\btetrahyd\s+roquinoline\b', 'tetrahydroquinoline', name, flags=re.IGNORECASE)  # tetrahyd roquinoline
+    name = re.sub(r"(\d+'?)\s+,", r'\1,', name)                             # 2' ,5' → 2',5'
+    name = re.sub(r',\s+(\d)', r',\1', name)                                # 5,6, 7 ,8 → 5,6,7,8
+    name = re.sub(r'\s+\]', ']', name)                                      # amino ] → amino]
+    name = re.sub(r'\s+', ' ', name).strip()
+    return name, {}
+
+CLEANING_PIPELINE = [
+    _rule_strip_diast_annotations,
+    _rule_strip_footnote_refs,
+    _rule_strip_trailing_garbage,
+    _rule_strip_salt_forms,
+    _rule_normalize_n_locants,
+    _rule_fix_spacing_artifacts,
+]
+
+def _apply_cleaning_pipeline(raw_name):
+    """Apply all cleaning rules in sequence. Returns (clean_name, metadata_dict)."""
+    name = raw_name
+    combined = {}
+    for rule_fn in CLEANING_PIPELINE:
+        name, meta = rule_fn(name)
+        for k, v in meta.items():
+            if k == 'handling_notes':
+                combined.setdefault('handling_notes', []).extend(v)
+            else:
+                combined[k] = v
+    return name, combined
+
+
+def parse_activity_table(pdf_path):
+    """Extract Table 3 rows from a Pfizer patent PDF that has an embedded text layer.
+
+    Returns a list of record dicts (may be more than one per PDF row for 'or' pairs):
+      example        – integer example number
+      example_suffix – '' normally; 'a'/'b' for stereoisomer 'or' pairs
+      ic50           – IC50 string as read from PDF
+      rep            – replicate count string
+      name           – raw compound name as extracted (both halves for 'or' pairs)
+      clean_name     – name ready for OPSIN (annotations stripped, artifacts fixed)
+      smiles         – filled in by caller after OPSIN conversion
+      status         – 'pending' until caller sets it
+      message        – OPSIN message (filled by caller)
+      page           – 1-based source page number
+      salt_form      – extracted salt descriptor (e.g. 'ammonium', 'trifluoroacetate')
+      stereo_note    – extracted DIAST stereo annotation
+      handling_notes – list of transformations applied
+      data_fields    – extensible dict; currently holds IC50_nM and n_replicates
+    """
+    import fitz  # PyMuPDF - imported locally to match existing pattern in this file
+
+    TABLE_FIRST = 235   # 0-indexed page number of the first table data page
+    TABLE_LAST  = 270   # stop scanning well past the end of Table 3
+
+    ENTRY_RE = re.compile(
+        r'^(\d{1,4}(?:\s+\d)?)\s*\n'   # Example number, optional space-separated footnote
+        r'([\d.>]+)\s*\n'               # IC50 value (numeric, may have > prefix)
+        r'(\d{1,2})\s*\n'               # replicate count
+        r'(.*)',                          # start of compound name
+        re.DOTALL
+    )
+
+    # PyMuPDF occasionally merges a right-column name prefix into the same block
+    # as the left-column entry header, producing text ordered as:
+    #   <name-prefix-lines>\n<NUM>\n<IC50>\n<REP>\n<name-suffix>
+    # ENTRY_RE cannot match this because the block does not start with a digit.
+    # This regex detects the embedded entry and reconstructs the correct order.
+    EMBEDDED_ENTRY_RE = re.compile(
+        r'^(.+?)\n'                       # name prefix (one or more lines, non-greedy)
+        r'(\d{1,4}(?:\s+\d)?)\s*\n'     # example number
+        r'([\d.>]+)\s*\n'               # IC50 value
+        r'(\d{1,2})\s*\n'              # replicate count
+        r'(.*)',                         # name suffix / continuation
+        re.DOTALL
+    )
+
+    doc = fitz.open(pdf_path)
+    all_items = []
+    table_found = False
+    table_done  = False
+    header_skip = True  # ignore column-header fragments until the first entry block
+
+    for pidx in range(TABLE_FIRST, min(TABLE_LAST, len(doc))):
+        if table_done:
+            break
+        page = doc[pidx]
+        for b in sorted(page.get_text("blocks"), key=lambda b: b[1]):
+            x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4]
+            text = text.strip()
+            if not text:
+                continue
+            if 'WO 2024' in text or 'PCT' in text:
+                continue
+            if re.match(r'^\d{2,3}$', text) and y0 > 700:
+                continue  # standalone page-number footer
+
+            if not table_found:
+                if 'Table 3.' in text or 'Table 3 ' in text:
+                    table_found = True
+                continue
+
+            # End-of-table: footnote section immediately after the last entry
+            if re.match(r'^1\.\s+Values represent\b', text, re.IGNORECASE):
+                table_done = True
+                break
+
+            sk = pidx * 100000 + y0
+
+            if x0 < 130:
+                m = ENTRY_RE.match(text)
+                if m:
+                    header_skip = False
+                    is_or = m.group(4).strip().lower() == 'or'
+                    all_items.append({
+                        'type': 'entry',
+                        'ex_raw': m.group(1).strip(),
+                        'ic50': m.group(2).strip(),
+                        'rep': m.group(3).strip(),
+                        'name_start': m.group(4).strip(),
+                        'is_or_entry': is_or,
+                        'page': pidx + 1,
+                        'sk': sk,
+                    })
+                    continue
+                em = EMBEDDED_ENTRY_RE.match(text)
+                if em:
+                    # Reconstruct: name = prefix + suffix (entry header was in the middle)
+                    prefix = em.group(1).strip()
+                    suffix = em.group(5).strip()
+                    name_start = (prefix + suffix) if prefix.endswith('-') \
+                                 else (prefix + ' ' + suffix).strip()
+                    header_skip = False
+                    all_items.append({
+                        'type': 'entry',
+                        'ex_raw': em.group(2).strip(),
+                        'ic50': em.group(3).strip(),
+                        'rep': em.group(4).strip(),
+                        'name_start': name_start,
+                        'is_or_entry': name_start.strip().lower() == 'or',
+                        'page': pidx + 1,
+                        'sk': sk,
+                    })
+                    continue
+
+            if header_skip and x0 < 250:
+                continue  # skip column-header fragments; name prefixes (x≥250) still captured
+
+            # Skip standalone connector words and dangling bracket closers from footnotes
+            if re.match(r'^(or|and|nor|of)$', text, re.IGNORECASE):
+                continue
+            if re.match(r'^\d*[)\]]$', text):
+                continue
+
+            all_items.append({'type': 'frag', 'text': text, 'page': pidx + 1, 'sk': sk})
+
+    doc.close()
+    if not all_items:
+        return []
+
+    entries = [i for i in all_items if i['type'] == 'entry']
+    frags   = [i for i in all_items if i['type'] == 'frag']
+
+    # Resolve example numbers; footnotes appear either concatenated ("12" = Ex1+fn2)
+    # or space-separated ("11 2" = Ex11+fn2). Use sequence continuity to tell apart.
+    last_ex = 0
+    for e in entries:
+        raw = e['ex_raw']
+        m = re.match(r'^(\d+)\s+\d+$', raw)
+        if m:
+            ex = int(m.group(1))
+        else:
+            n = int(raw)
+            if n > last_ex + 5 and len(raw) >= 2:
+                cand = int(raw[:-1])
+                ex = cand if 0 < cand <= 999 and cand > last_ex else n
+            else:
+                ex = n
+        e['ex_num'] = ex
+        e['name_parts'] = [e['name_start']] if e['name_start'] else []
+        last_ex = ex
+
+    # Assign each fragment to the nearest entry by sort-key proximity.
+    # Special case for "or" entries: their second-isomer name fragments extend
+    # toward the next entry but still belong to the "or" entry. Keep them there
+    # unless the fragment is multi-line (= a full sub-name prefixing the next entry)
+    # or is ≥2× closer to the next entry than to the "or" entry.
+    for frag in frags:
+        fk = frag['sk']
+        prev = next_e = None
+        for e in entries:
+            if e['sk'] < fk:
+                prev = e
+            elif next_e is None and e['sk'] > fk:
+                next_e = e
+                break
+        if next_e is None:
+            if prev:
+                prev['name_parts'].append(frag['text'])
+        elif prev is None:
+            next_e['name_parts'].insert(0, frag['text'])
+        else:
+            if prev.get('is_or_entry') and '\n' not in frag['text']:
+                dist_prev = fk - prev['sk']
+                dist_next = next_e['sk'] - fk
+                if dist_next >= dist_prev / 2:
+                    prev['name_parts'].append(frag['text'])
+                    continue
+            if (next_e['sk'] - fk) < (fk - prev['sk']):
+                next_e['name_parts'].insert(0, frag['text'])
+            else:
+                prev['name_parts'].append(frag['text'])
+
+    results = []
+    for e in entries:
+        parts = [p for p in e['name_parts'] if p]
+        raw_name = ''
+        for part in parts:
+            # No space after a trailing hyphen: line-break artifact in chemical names
+            if raw_name and raw_name[-1] == '-':
+                raw_name += part.lstrip()
+            elif raw_name:
+                raw_name += ' ' + part
+            else:
+                raw_name = part
+        raw_name = re.sub(r'\s+', ' ', raw_name).strip()
+
+        clean, meta = _apply_cleaning_pipeline(raw_name)
+
+        def _make_record(ex_num, suffix, cname, rname, e, meta):
+            return {
+                'example':        ex_num,
+                'example_suffix': suffix,
+                'ic50':           e['ic50'],
+                'rep':            e['rep'],
+                'name':           rname,
+                'clean_name':     cname,
+                'smiles':         '',
+                'status':         'pending',
+                'message':        '',
+                'page':           e['page'],
+                'salt_form':      meta.get('salt_form', ''),
+                'stereo_note':    meta.get('stereo_note', ''),
+                'handling_notes': list(meta.get('handling_notes', [])),
+                'data_fields':    {'IC50_nM': e['ic50'], 'n_replicates': e['rep']},
+            }
+
+        # "or" stereoisomer pairs: split into a/b records (one per isomer)
+        if e.get('is_or_entry') and ' or ' in clean:
+            halves = clean.split(' or ', 1)
+            for suffix, half in zip(('a', 'b'), halves):
+                rec = _make_record(e['ex_num'], suffix, half.strip(), raw_name, e, meta)
+                rec['handling_notes'].insert(0, 'or-pair split')
+                results.append(rec)
+        else:
+            results.append(_make_record(e['ex_num'], '', clean, raw_name, e, meta))
+
+    return results
+
+
+# ============================================================
 # OPSIN (name -> structure)
 # ============================================================
 
@@ -499,10 +919,15 @@ def fetch_opsin(name: str) -> dict:
         }
 
     except urllib.error.HTTPError as e:
-        # The server responded, but with an error status code (like 404
-        # Not Found or 500 Server Error). e.code holds that number.
+        # OPSIN returns 404 when it cannot parse the input as a chemical
+        # name - that's its normal "not found" response, not a real
+        # internet error.  Never surface raw HTTP codes to the user.
+        if e.code == 404:
+            msg = "Not a recognized chemical name"
+        else:
+            msg = "OPSIN service error — try again shortly"
         return {"name": name, "status": "ERROR", "smiles": "", "inchikey": "",
-                 "message": f"HTTP {e.code}"}
+                 "message": msg}
 
     except urllib.error.URLError as e:
         # We couldn't even reach the server at all - e.g. no internet
@@ -516,6 +941,29 @@ def fetch_opsin(name: str) -> dict:
         # text we can show the user.
         return {"name": name, "status": "ERROR", "smiles": "", "inchikey": "",
                  "message": str(e)}
+
+
+_SMILES_BRACKET  = re.compile(r'\[(?:[0-9]+)?[A-Za-z][^\]]*\]')  # [nH] [NH+] [13C] [3H]
+_SMILES_AROMATIC = re.compile(r'[cnosp][0-9]')                   # c1 n1 aromatic ring-closure
+_SMILES_BOND     = re.compile(r'\S=\S|\S#[A-Za-z0-9]')           # C=C C#N (= and # never in IUPAC)
+
+
+def _looks_like_smiles(text: str) -> bool:
+    """Conservative check: returns True only when the text contains
+    patterns that are unambiguous SMILES and essentially never appear
+    in legitimate IUPAC chemical names.
+
+    Bracket atoms like [nH]/[NH+]/[13C], aromatic ring-closure digits
+    (c1, n1), and bond characters = / # are all reliable SMILES
+    signals.  IUPAC bridged-ring descriptors like [2.2.2] are NOT
+    matched because the bracket pattern requires a letter after the
+    optional isotope number."""
+    t = text.strip()
+    return bool(
+        _SMILES_BRACKET.search(t)
+        or _SMILES_AROMATIC.search(t)
+        or _SMILES_BOND.search(t)
+    )
 
 
 def rotate_point(px, py, angle_deg, cx, cy):
@@ -685,6 +1133,27 @@ class ScientistAnimation:
 # DECIMER (image -> structure) - lazy-loaded, heavy dependency
 # ============================================================
 
+def _is_harmless_startup_noise(line: str) -> bool:
+    """TensorFlow (and the GPU libraries it tries to use) print a
+    predictable set of harmless diagnostic lines on every startup, on
+    every machine without an NVIDIA GPU - things like 'could not find
+    cuda drivers' and 'TF-TRT Warning'. None of this indicates an actual
+    problem; it's just TensorFlow announcing it's running in CPU-only
+    mode, which is expected and fine. Filtering these out means a real
+    error, if one occurs, isn't buried under - or mistaken for - this
+    routine noise.
+    """
+    noise_markers = (
+        "tensorflow/", "external/local_", "cuda", "cudnn", "cufft", "cublas",
+        "tf-trt", "cpu_feature_guard", "onednn", "could not find cuda drivers",
+        # The AVX2/FMA line is a continuation printed WITHOUT a "tensorflow/" prefix,
+        # so it needs its own marker.  "absl::" catches the absl log-init warning.
+        "avx", "absl::", "rebuild tensorflow",
+    )
+    lowered = line.lower()
+    return any(marker in lowered for marker in noise_markers)
+
+
 class DecimerEngine:
     """Talks to a SEPARATE program (the 'OPSINator DECIMER Engine') rather
     than importing DECIMER directly into this process.
@@ -703,34 +1172,60 @@ class DecimerEngine:
 
     def __init__(self):
         self.load_error = None
+        self.dev_mode_missing = False  # True only when running from source, not built yet
         self._engine_path = self._find_engine_executable()
         if self._engine_path is None:
-            self.load_error = (
-                "Could not find the OPSINator DECIMER Engine executable. "
-                "It should be installed alongside this app."
-            )
+            if getattr(sys, "frozen", False):
+                # This IS a real problem - we're a built app, and a file
+                # that should have been installed alongside us isn't.
+                self.load_error = (
+                    "Could not find the OPSINator DECIMER Engine executable. "
+                    "It should be installed alongside this app."
+                )
+            else:
+                # This is EXPECTED, not a problem - we're running the raw
+                # .py source directly, before any build has produced a
+                # compiled opsinator_engine to sit next to it.
+                self.dev_mode_missing = True
 
     def _find_engine_executable(self):
-        """Looks for the engine executable in the same folder as this
-        app. Returns its full path, or None if it isn't there.
+        """Looks for something runnable in the same folder as this app:
+        first a real compiled executable (the normal case once this app
+        has actually been built), and if that's not there, a plain
+        opsinator_engine.py sitting alongside it instead - so the app
+        works directly during development, without needing a build or
+        a manual shim script first.
 
-        CONCEPT: sys.executable is the path to the currently running
-        program when this app itself has been frozen into an exe by
-        PyInstaller/Nuitka. os.path.dirname() then gives us the folder
-        it lives in, so we can look for a sibling file right next to it.
+        Sets self._invoke_prefix to the extra command-line piece needed
+        to run whatever was found: empty for a real executable (it runs
+        itself), or [sys.executable] for a plain .py file (which needs
+        "python3 opsinator_engine.py ..." rather than being run directly).
         """
         if getattr(sys, "frozen", False):
             app_dir = os.path.dirname(sys.executable)
         else:
             app_dir = os.path.dirname(os.path.abspath(__file__))
 
-        candidates = [
+        compiled_candidates = [
             os.path.join(app_dir, "opsinator_engine.exe"),   # Windows
             os.path.join(app_dir, "opsinator_engine"),         # Linux / macOS
         ]
-        for path in candidates:
+        for path in compiled_candidates:
             if os.path.isfile(path):
+                self._invoke_prefix = []
                 return path
+
+        # No compiled engine yet - fall back to running the plain source
+        # file directly with this same Python interpreter, IF it's
+        # actually sitting there and DECIMER is importable by this
+        # interpreter. This is what lets the GUI work end-to-end during
+        # development with no manual setup beyond "pip install decimer".
+        source_fallback = os.path.join(app_dir, "opsinator_engine.py")
+        if os.path.isfile(source_fallback):
+            self._invoke_prefix = [sys.executable]
+            return source_fallback
+
+        self._invoke_prefix = []
         return None
 
     def is_loaded(self):
@@ -750,54 +1245,504 @@ class DecimerEngine:
         if status_callback and self.is_loaded():
             status_callback("Ready.")
 
-    def predict(self, image_path: str) -> str:
+    def predict(self, image_path: str, status_callback=None) -> str:
         """Runs image recognition by launching the separate engine
-        program as a subprocess and reading its output, instead of
-        calling a function inside this process."""
+        program as a subprocess, reading its output LINE BY LINE as it's
+        produced (rather than waiting silently for it to finish).
+
+        status_callback, if provided, is called with each line of
+        output that ISN'T the final result - this is how DECIMER's own
+        progress messages (e.g. "Downloading trained model to ...",
+        printed during a first-run model download) reach the GUI live,
+        instead of the user staring at an unchanging "please wait" for
+        however long that download takes.
+        """
         if self._engine_path is None:
             raise RuntimeError(self.load_error or "DECIMER engine not found")
 
-        # CONCEPT: subprocess.run() starts another program, waits for it
-        # to finish, and hands back what it printed. capture_output=True
-        # captures both its normal output (stdout) and any error
-        # messages (stderr) instead of letting them print to this app's
-        # own console.
-        result = subprocess.run(
-            [self._engine_path, image_path],
-            capture_output=True,
+        # CONCEPT: subprocess.Popen() (unlike subprocess.run()) doesn't
+        # wait for the program to finish before handing control back -
+        # it gives us a live handle to the still-running process, so we
+        # can read its output as it arrives, line by line, in real time.
+        #
+        # stderr=subprocess.STDOUT merges both streams into one. This
+        # matters more than it might look: reading only stdout while
+        # stderr fills up UNREAD in its own pipe can deadlock the whole
+        # thing outright once that pipe's buffer is full - the child
+        # process blocks trying to write more, while we're blocked
+        # waiting for output that will now never arrive. TensorFlow
+        # writes a lot to stderr on startup, so this isn't a theoretical
+        # risk - merging the streams removes it completely.
+        process = subprocess.Popen(
+            [*self._invoke_prefix, self._engine_path, image_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=300,  # generous ceiling - first-run model download can be slow
+            bufsize=1,  # line-buffered: hand us each line as soon as it's printed
         )
 
-        if result.returncode != 0:
-            error_text = result.stderr.strip() or "Unknown error from DECIMER engine"
+        result_smiles = None
+        result_prefix = "OPSINATOR_RESULT:"
+        other_lines = []
+
+        # Read every line as it's produced. This loop ends naturally
+        # once the engine process closes its output (i.e. when it
+        # finishes), without us needing to poll or sleep.
+        for line in process.stdout:
+            line = line.rstrip("\n")
+            if line.startswith(result_prefix):
+                result_smiles = line[len(result_prefix):]
+            elif line and not _is_harmless_startup_noise(line):
+                other_lines.append(line)
+                if status_callback:
+                    status_callback(line)
+
+        process.wait(timeout=300)  # generous ceiling - first-run model download can be slow
+
+        if process.returncode != 0 or result_smiles is None:
+            error_text = "\n".join(other_lines[-10:]) or "Unknown error from DECIMER engine"
             raise RuntimeError(error_text)
 
-        return result.stdout.strip()
+        return result_smiles.strip()
 
 
-def check_decimer_update() -> dict:
-    """Compares the installed 'decimer' package version against the
-    latest one published on PyPI (the Python Package Index, the official
-    place Python packages are published). Returns a dictionary describing
-    what it found. This function is careful never to raise an exception -
-    any network or parsing problem is reported inside the returned
-    dictionary as an "error" entry instead.
+class SegmentationEngine:
+    """Talks to a SEPARATE program (the 'OPSINator Segmentation Engine'),
+    the same way DecimerEngine talks to the recognition engine.
+
+    Why this is its own program: DECIMER Segmentation needs an OLDER
+    TensorFlow version than the recognition engine does, and that older
+    TensorFlow has no installable wheel at all for the Python version
+    this app itself runs on (confirmed directly, not assumed) - so it
+    genuinely cannot live in the same Python environment as anything
+    else in OPSINator. It needs its own separate Python 3.11 setup,
+    packaged as its own separate executable.
+    """
+
+    def __init__(self):
+        self.load_error = None
+        self.dev_mode_missing = False
+        self._engine_path = self._find_engine_executable()
+        if self._engine_path is None:
+            if getattr(sys, "frozen", False):
+                self.load_error = (
+                    "Could not find the OPSINator Segmentation Engine executable. "
+                    "It should be installed alongside this app."
+                )
+            else:
+                self.dev_mode_missing = True
+
+    def _find_engine_executable(self):
+        if getattr(sys, "frozen", False):
+            app_dir = os.path.dirname(sys.executable)
+        else:
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+
+        compiled_candidates = [
+            os.path.join(app_dir, "opsinator_segmentation.exe"),
+            os.path.join(app_dir, "opsinator_segmentation"),
+        ]
+        for path in compiled_candidates:
+            if os.path.isfile(path):
+                self._invoke_prefix = []
+                return path
+
+        # Same .py fallback idea as DecimerEngine - BUT with an honest
+        # limit: Segmentation needs an older Python (3.11) than this
+        # app itself runs on, confirmed directly earlier.
+        source_fallback = os.path.join(app_dir, "opsinator_segmentation.py")
+        if os.path.isfile(source_fallback):
+            self._invoke_prefix = [self._find_compatible_python()]
+            return source_fallback
+
+        self._invoke_prefix = []
+        return None
+
+    def _find_compatible_python(self):
+        """Looks for a Python interpreter that can actually run
+        Segmentation, automatically - no manual setup needed at launch
+        time. Checks, in order: an explicit override (for anyone who
+        wants to point at something unusual), a few common local
+        locations where a compatible environment is typically set up
+        during development/testing, and only then falls back to this
+        app's own interpreter (which will likely be incompatible,
+        producing the clear Python-version error rather than failing
+        silently)."""
+        override = os.environ.get("OPSINATOR_SEGMENTATION_PYTHON")
+        if override and os.path.isfile(override):
+            return override
+
+        common_candidates = [
+            os.path.join(os.path.expanduser("~"), "opsinator_segmentation_env", "bin", "python3"),
+            os.path.join(os.path.expanduser("~"), "opsinator_segmentation_env", "Scripts", "python.exe"),
+        ]
+        for candidate in common_candidates:
+            if os.path.isfile(candidate):
+                return candidate
+
+        return sys.executable
+
+    def is_loaded(self):
+        return self._engine_path is not None and self.load_error is None
+
+    def find_all_structures(self, pages_dir: str, output_dir: str, total_pages: int,
+                             status_callback=None, on_structure_found=None) -> list:
+        """Runs page segmentation ONCE for an entire folder of rendered
+        pages - not once per page - so TensorFlow and the model only
+        ever load a single time, no matter how many pages the document
+        has. Streams live "page N of M" progress back as it works
+        through them, rather than going silent until everything's done.
+
+        on_structure_found: optional callable(dict) called immediately
+        for each structure as it is found (background thread), where the
+        dict is {"page": int, "crop_path": str, "bbox": tuple}.
+
+        Returns a list of all found structure dicts (same objects passed
+        to on_structure_found, if provided).
+        """
+        if self._engine_path is None:
+            raise RuntimeError(self.load_error or "Segmentation engine not found")
+
+        # stderr=subprocess.STDOUT merges both streams into one pipe -
+        # same reasoning as DecimerEngine.predict(): reading only stdout
+        # while a separate stderr pipe fills up unread (TensorFlow is
+        # genuinely verbose on stderr at startup) can deadlock the whole
+        # call outright, not just produce confusing output.
+        process = subprocess.Popen(
+            [*self._invoke_prefix, self._engine_path, pages_dir, output_dir],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        found = []
+        other_lines = []
+        for line in process.stdout:
+            line = line.rstrip("\n")
+            if line.startswith("PAGE:"):
+                pass  # page counter suppressed; status label holds "Scanning for structures" throughout
+            elif line.startswith("CROP:"):
+                rest = line[len("CROP:"):].strip()
+                crop_path, _, remainder = rest.partition("|")
+                page_text, _, bbox_text = remainder.partition("|")
+                try:
+                    page_num = int(page_text)
+                    bbox = tuple(int(n) for n in bbox_text.split(","))
+                except ValueError:
+                    page_num, bbox = 0, None
+                structure = {"page": page_num, "crop_path": crop_path, "bbox": bbox}
+                found.append(structure)
+                if on_structure_found:
+                    on_structure_found(structure)
+            elif line and not _is_harmless_startup_noise(line):
+                other_lines.append(line)
+
+        # A whole document, processed in one run, genuinely needs a
+        # generous ceiling - the model load alone can take a while, and
+        # each page after that takes real CPU time too on a machine
+        # with no GPU. An hour is a deliberately high ceiling, not a
+        # guess at the "right" duration.
+        process.wait(timeout=3600)
+
+        if process.returncode != 0:
+            error_text = "\n".join(other_lines[-10:]) or "Unknown error from Segmentation engine"
+            raise RuntimeError(error_text)
+
+        return found
+
+
+def sanitize_filename(text: str, max_length: int = 60) -> str:
+    """Turns arbitrary text (a chemical name, which can contain all
+    sorts of punctuation) into something safe to use as a filename on
+    Windows, macOS, and Linux alike - replacing anything that any of
+    those operating systems would reject, and trimming overly long names."""
+    safe = re.sub(r'[<>:"/\\|?*]', "_", text).strip()
+    safe = safe or "structure"
+    return safe[:max_length]
+
+
+def ask_save_scope(root, item_count):
+    """Shows a small dialog asking whether to save just the currently
+    selected row, or every result at once. Returns "selected", "all",
+    or None if the user closed the dialog without choosing.
+
+    A plain yes/no messagebox isn't expressive enough for this choice
+    (the two options aren't naturally "yes" and "no"), so this builds a
+    minimal custom dialog with clearly labeled buttons instead.
+    """
+    choice = {"value": None}
+
+    dialog = tk.Toplevel(root)
+    dialog.title("Save MOL")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+
+    tk.Label(
+        dialog,
+        text=f"Save just the selected row, or all {item_count} result(s)?\n\n"
+             "A MOL file holds exactly one structure, so saving all results "
+             "creates one separate file per structure in a folder you choose.",
+        justify="left", wraplength=360, padx=16, pady=12,
+    ).pack()
+
+    btn_row = tk.Frame(dialog)
+    btn_row.pack(pady=(0, 12))
+
+    def pick(value):
+        choice["value"] = value
+        dialog.destroy()
+
+    tk.Button(btn_row, text="Save Selected Row", width=16,
+              command=lambda: pick("selected")).pack(side="left", padx=6)
+    tk.Button(btn_row, text=f"Save All {item_count} as Separate Files", width=26,
+              command=lambda: pick("all")).pack(side="left", padx=6)
+    tk.Button(btn_row, text="Cancel", width=10,
+              command=lambda: pick(None)).pack(side="left", padx=6)
+
+    dialog.update_idletasks()
+    dialog.deiconify()
+    dialog.lift()
+    dialog.attributes("-topmost", True)
+    dialog.after(200, lambda: dialog.attributes("-topmost", False))
+    dialog.focus_force()
+
+    root.wait_window(dialog)  # blocks here until the dialog is closed
+    return choice["value"]
+
+
+def render_pdf_pages_to_images(pdf_path: str, output_dir: str, dpi: int = 200,
+                                status_callback=None) -> list:
+    """Renders every page of a PDF to its own PNG image file, using
+    PyMuPDF (imported as 'fitz', its internal module name - the package
+    name on PyPI is 'pymupdf'). Returns a list of the saved image file
+    paths, one per page, in page order.
+
+    This runs directly in the main app's own process - PyMuPDF is light
+    (tens of MB, no TensorFlow involved), unlike the recognition and
+    segmentation engines, which is why it doesn't need to be split out
+    into a separate program the way those did.
+    """
+    try:
+        import fitz
+    except ImportError:
+        if not ensure_package_installed("pymupdf", status_callback=status_callback):
+            raise RuntimeError("Could not install PyMuPDF (needed to read PDF files) automatically.")
+        import fitz
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    image_paths = []
+    zoom = dpi / 72  # PDF coordinates are in 72-DPI points by convention
+
+    doc = fitz.open(pdf_path)
+    try:
+        for page_index in range(len(doc)):
+            page = doc.load_page(page_index)
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+            image_path = os.path.join(output_dir, f"{base_name}_page_{page_index + 1}.png")
+            pix.save(image_path)
+            image_paths.append(image_path)
+    finally:
+        doc.close()
+
+    return image_paths
+
+
+def find_label_near_bbox(pdf_path: str, page_index: int, bbox_pixels, dpi: int = 200,
+                          page_image_path: str = None) -> str:
+    """Looks for a text label (a compound name or number) printed near a
+    structure's position on the page.
+
+    Tries the PDF's own text layer first (fast, exact). Falls back to
+    OCR via pytesseract on the rendered page PNG when the text layer is
+    empty (e.g. scanned/image-only PDFs - the common case for patents).
+
+    bbox_pixels is (y0, x0, y1, x1) in the pixel coordinate system used
+    when the page was rendered at the given dpi.
+
+    Returns the found text, or "No label" if nothing turned up nearby.
+    """
+    if not bbox_pixels:
+        return "No label"
+
+    try:
+        import fitz
+    except ImportError:
+        if not ensure_package_installed("pymupdf"):
+            return "No label"
+        import fitz
+
+    zoom = dpi / 72
+    y0, x0, y1, x1 = bbox_pixels
+    # Convert pixel coordinates back to the PDF's own point coordinates.
+    px0, py0, px1, py1 = x0 / zoom, y0 / zoom, x1 / zoom, y1 / zoom
+
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc.load_page(page_index)
+
+        # Checked in this order based on two different REAL examples
+        # from an actual patent: a compound's name is often printed
+        # directly ABOVE its structure (e.g. an "Intermediate Example"
+        # heading), while a short Roman-numeral label in a reaction
+        # scheme sits BESIDE its structure instead. BELOW is checked
+        # too, but last and most cautiously - that's exactly where a
+        # paragraph of unrelated procedure text is also likely to start
+        # (confirmed directly: real procedure text sits there in the
+        # same document), so a match there needs to look genuinely
+        # label-shaped, not just be "the nearest text downward."
+        #
+        # The window heights here (22pt) are deliberately short -
+        # roughly one typeset line - specifically so a multi-line
+        # paragraph mostly falls OUTSIDE the search area in the first
+        # place, rather than relying only on the length check below.
+        search_rects = [
+            fitz.Rect(px0 - 10, py0 - 22, px1 + 10, py0),       # above
+            fitz.Rect(px1, py0 - 5, px1 + 50, py1 + 5),         # right
+            fitz.Rect(px0 - 50, py0 - 5, px0, py1 + 5),         # left
+            fitz.Rect(px0 - 10, py1, px1 + 10, py1 + 22),       # below
+        ]
+
+        for rect in search_rects:
+            raw = page.get_text("text", clip=rect).strip()
+            if not raw:
+                continue
+
+            # A real label is essentially one line, even if that line
+            # itself is long (IUPAC names can be lengthy). Multiple
+            # internal line breaks is the signature of wrapped
+            # paragraph prose spilling into the search area, not a
+            # genuine single label - skip it and try the next direction
+            # rather than returning a misleading snippet of someone
+            # else's sentence.
+            if raw.count("\n") > 1:
+                continue
+
+            text = " ".join(raw.split())
+            if text:
+                return text[:150]
+    finally:
+        doc.close()
+
+    # PDF text layer found nothing (image-only PDF). Try OCR on the
+    # rendered page PNG if we have it.
+    if page_image_path and os.path.isfile(page_image_path):
+        ocr_label = _ocr_label_near_bbox(page_image_path, bbox_pixels)
+        if ocr_label:
+            return ocr_label
+
+    return "No label"
+
+
+def _ocr_label_near_bbox(page_image_path: str, bbox_pixels) -> str:
+    """Crops search regions around a structure's bbox in a rendered page
+    PNG and runs tesseract OCR on each, returning the first plausible
+    single-line label found, or an empty string if nothing was found."""
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        return ""
+
+    try:
+        img = Image.open(page_image_path)
+        iw, ih = img.size
+        y0, x0, y1, x1 = bbox_pixels
+        pad = 8
+
+        # Same direction order as the PDF text-layer search: above,
+        # right, left, below. Pixel crop windows are proportionally
+        # deeper than the pt windows above because rendered PNGs are at
+        # 200 DPI vs the 72-pt PDF coordinate space.
+        regions = [
+            (max(0, x0 - pad), max(0, y0 - 90), min(iw, x1 + pad), max(0, y0 - pad)),   # above
+            (min(iw, x1 + pad), max(0, y0 - pad), min(iw, x1 + 200), min(ih, y1 + pad)), # right
+            (max(0, x0 - 200), max(0, y0 - pad), max(0, x0 - pad), min(ih, y1 + pad)),   # left
+            (max(0, x0 - pad), min(ih, y1 + pad), min(iw, x1 + pad), min(ih, y1 + 90)), # below
+        ]
+
+        for left, top, right, bottom in regions:
+            if right <= left or bottom <= top:
+                continue
+            crop = img.crop((left, top, right, bottom))
+            # PSM 7 = single text line; best for short compound labels
+            text = pytesseract.image_to_string(crop, config="--psm 7").strip()
+            if not text:
+                text = pytesseract.image_to_string(crop, config="--psm 6").strip()
+            if not text or len(text) > 200 or text.count("\n") > 2:
+                continue
+            clean = " ".join(text.split())
+            if clean:
+                return clean[:150]
+
+        return ""
+    except Exception:
+        return ""
+
+
+def _lookup_iupac_pubchem(smiles: str):
+    """Looks up the IUPAC name for a SMILES string from PubChem REST API.
+    Returns the name string, or None if the lookup failed for any reason.
+    Safe to call from a background thread.
+    """
+    if not smiles:
+        return None
+    try:
+        encoded = urllib.parse.quote(smiles, safe="")
+        url = (
+            "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/"
+            f"{encoded}/property/IUPACName/TXT"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "OPSINator/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            name = resp.read().decode("utf-8").strip()
+        return name if name else None
+    except Exception:
+        return None
+
+
+def check_decimer_update(engine_path, invoke_prefix=None) -> dict:
+    """Compares the DECIMER engine's installed 'decimer' package version
+    against the latest one published on PyPI. Returns a dictionary
+    describing what it found. This function is careful never to raise
+    an exception - any network or parsing problem is reported inside
+    the returned dictionary as an "error" entry instead.
+
+    IMPORTANT: this asks the SEPARATE engine program for its version,
+    rather than checking this process's own installed packages. After
+    splitting DECIMER out into its own executable, this app's own
+    process never has the 'decimer' package installed at all - only the
+    engine does. Checking locally would always (incorrectly) report
+    "not installed".
+
+    engine_path: full path to the opsinator_engine executable, or None
+                 if it wasn't found.
     """
     result = {"installed": None, "latest": None, "update_available": False, "error": None}
 
+    if engine_path is None:
+        result["error"] = "DECIMER engine executable not found"
+        return result
+
     try:
-        # importlib.metadata.version() asks Python's own package manager
-        # "what version of this package is currently installed?" without
-        # needing to actually import (and therefore load TensorFlow) the
-        # package itself.
-        result["installed"] = importlib.metadata.version("decimer")
-    except importlib.metadata.PackageNotFoundError:
-        # The package genuinely isn't installed in this build at all.
-        result["installed"] = None
+        # Ask the separate engine program for its version. This is fast
+        # and safe - the engine's --version flag deliberately avoids
+        # importing DECIMER itself, so this doesn't trigger TensorFlow
+        # loading or a model download.
+        proc = subprocess.run(
+            [*(invoke_prefix or []), engine_path, "--version"],
+            capture_output=True, text=True, timeout=15
+        )
+        version_text = proc.stdout.strip()
+        if proc.returncode != 0 or not version_text or version_text == "not-installed":
+            result["installed"] = None
+        else:
+            result["installed"] = version_text
     except Exception as e:
         result["error"] = str(e)
-        return result  # CONCEPT: an early `return` lets us stop a function partway through
+        return result
 
     try:
         req = urllib.request.Request(PYPI_DECIMER_URL, headers={"User-Agent": "OPSINator/1.0"})
@@ -818,6 +1763,63 @@ def check_decimer_update() -> dict:
 # RDKit (SMILES -> MOL / SDF structure files) - lazy-loaded
 # ============================================================
 
+def ensure_package_installed(package_name: str, status_callback=None) -> bool:
+    """Checks whether a package is importable by THIS Python interpreter,
+    and installs it automatically via pip if not - same proven approach
+    already used for the DECIMER engine, applied here for RDKit (which
+    runs directly in this app's own process, not a separate engine).
+
+    Returns True if the package is now available (whether it already
+    was, or was just installed), False if installation genuinely failed.
+    """
+    def status(msg):
+        if status_callback:
+            status_callback(msg)
+
+    try:
+        importlib.metadata.version(package_name)
+        return True  # already installed - nothing to do
+    except importlib.metadata.PackageNotFoundError:
+        pass
+
+    status(f"Installing '{package_name}'...")
+
+    base_cmd = [sys.executable, "-m", "pip", "install", package_name]
+
+    def _try_install(cmd):
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        output_lines = []
+        for line in process.stdout:
+            line = line.rstrip("\n")
+            if line:
+                status(line)
+                output_lines.append(line)
+        process.wait(timeout=600)
+        return process.returncode, "\n".join(output_lines)
+
+    returncode, output = _try_install(base_cmd)
+
+    # Same Ubuntu-specific "externally managed" handling as the engine.
+    if returncode != 0 and "externally-managed-environment" in output:
+        status("Retrying install (this system protects its default Python "
+               "environment by default)...")
+        returncode, output = _try_install(base_cmd + ["--break-system-packages"])
+
+    # The install just happened in a SEPARATE process - this process's
+    # own cache of "what's installed" is stale until refreshed.
+    importlib.invalidate_caches()
+
+    try:
+        importlib.metadata.version(package_name)
+        status(f"'{package_name}' installed successfully.")
+        return True
+    except importlib.metadata.PackageNotFoundError:
+        return False
+
+
 class MolConverter:
     """A small wrapper around RDKit, the standard open-source chemistry
     toolkit, used only to turn a SMILES string into a real structure
@@ -837,7 +1839,7 @@ class MolConverter:
     def is_loaded(self):
         return self._Chem is not None
 
-    def ensure_loaded(self):
+    def ensure_loaded(self, status_callback=None):
         if self._Chem is not None or self.load_error is not None:
             return
         try:
@@ -845,6 +1847,19 @@ class MolConverter:
             from rdkit.Chem import AllChem
             self._Chem = Chem
             self._AllChem = AllChem
+        except ImportError:
+            # Not installed at all - try installing it automatically,
+            # then try the import again, rather than just giving up.
+            if ensure_package_installed("rdkit", status_callback=status_callback):
+                try:
+                    from rdkit import Chem
+                    from rdkit.Chem import AllChem
+                    self._Chem = Chem
+                    self._AllChem = AllChem
+                except Exception as e:
+                    self.load_error = str(e)
+            else:
+                self.load_error = "Could not install RDKit automatically."
         except Exception as e:
             self.load_error = str(e)
 
@@ -934,10 +1949,18 @@ class OpsinatorApp:
 
         # --- the two heavy, lazily-loaded engines ---
         self.decimer = DecimerEngine()
+        self.segmentation = SegmentationEngine()
         self.mol_converter = MolConverter()
 
         # --- state for the Image -> Structure tab ---
-        self.current_image_path = None
+        self.current_image_paths = []
+        self.found_structures = []   # list of {"page": int, "crop_path": str} from the last PDF scan
+        self.pdf_scratch_dir = None  # temp folder holding that scan's rendered pages and crops
+        self.pdf_source_name = ""    # the PDF's filename, used to label results once recognized
+
+        # Remembered across restarts via load_settings() - defaults to
+        # the user's home folder the very first time the app ever runs.
+        self.last_directory = load_settings().get("last_directory") or os.path.expanduser("~")
         self.image_results = []     # list of dicts: {"source": filename, "smiles": "..."}
 
         self._build_menu()
@@ -979,6 +2002,8 @@ class OpsinatorApp:
         help_menu.add_command(label="License & Attribution", command=self._show_license_readonly)
         help_menu.add_separator()
         help_menu.add_command(label="Check for updates", command=self._check_for_updates_manual)
+        help_menu.add_command(label="Roll back DECIMER model update", command=self._on_rollback_decimer)
+        help_menu.add_command(label="Clean up old DECIMER model backup", command=self._on_cleanup_decimer)
         help_menu.add_separator()
         help_menu.add_command(label="About OPSINator", command=self._show_about)
         menubar.add_cascade(label="Help", menu=help_menu)
@@ -1055,7 +2080,7 @@ class OpsinatorApp:
         DECIMER version, but only updates the status text if one is
         found or genuinely couldn't be checked - it never pops up a
         dialog box on its own (that would be annoying every launch)."""
-        result = check_decimer_update()
+        result = check_decimer_update(self.decimer._engine_path, self.decimer._invoke_prefix)
         # CONCEPT: we're currently running on a background thread, but
         # updating a tkinter Label must happen on the main thread. So
         # instead of touching the widget directly here, we use
@@ -1071,22 +2096,84 @@ class OpsinatorApp:
         threading.Thread(target=self._check_for_updates_worker, daemon=True).start()
 
     def _check_for_updates_worker(self):
-        result = check_decimer_update()
+        result = check_decimer_update(self.decimer._engine_path, self.decimer._invoke_prefix)
         self.root.after(0, lambda: self._handle_update_result(result, silent=False))
+
+    def _show_engine_unavailable(self, action_description):
+        """Shows the right kind of message depending on WHY the engine
+        is unavailable: a calm, informational note if this is simply
+        expected (running from source, before any build exists), or a
+        real error if something that should be there genuinely isn't."""
+        if self.decimer.dev_mode_missing:
+            messagebox.showinfo(
+                "Not yet built",
+                f"{action_description} requires the compiled DECIMER engine, "
+                "which doesn't exist yet because this is running directly "
+                "from source rather than as a built app. This is expected "
+                "during development, not an error - it will work normally "
+                "once the app is packaged.",
+            )
+        else:
+            messagebox.showerror("Not available", self.decimer.load_error or "DECIMER engine not found.")
+
+    def _on_rollback_decimer(self):
+        """Asks the engine to restore the previous DECIMER model version,
+        if one was backed up before the most recent update."""
+        if self.decimer._engine_path is None:
+            self._show_engine_unavailable("Rolling back a model update")
+            return
+        try:
+            result = subprocess.run(
+                [*self.decimer._invoke_prefix, self.decimer._engine_path, "--rollback"],
+                capture_output=True, text=True, timeout=30,
+            )
+            message = (result.stdout or result.stderr).strip()
+            if result.returncode == 0:
+                messagebox.showinfo("Rollback", message or "Rolled back successfully.")
+            else:
+                messagebox.showwarning("Rollback", message or "Nothing to roll back to.")
+        except Exception as e:
+            messagebox.showerror("Rollback failed", str(e))
+
+    def _on_cleanup_decimer(self):
+        """Asks the engine to delete any backed-up old model version."""
+        if self.decimer._engine_path is None:
+            self._show_engine_unavailable("Cleaning up old model backups")
+            return
+        try:
+            result = subprocess.run(
+                [*self.decimer._invoke_prefix, self.decimer._engine_path, "--cleanup"],
+                capture_output=True, text=True, timeout=30,
+            )
+            message = (result.stdout or result.stderr).strip()
+            messagebox.showinfo("Cleanup", message or "Done.")
+        except Exception as e:
+            messagebox.showerror("Cleanup failed", str(e))
 
     def _handle_update_result(self, result, silent):
         """Shared logic for both the silent startup check and the manual
         Help-menu check. `silent=True` means: update the status bar text
         quietly, but never interrupt the user with a pop-up dialog."""
-        if result.get("error") and not silent:
-            self.status_label2.config(text="Could not check for updates (offline?).")
-            return
         if result.get("error"):
-            return  # silent check failed - just say nothing rather than alarm anyone
+            if self.decimer.dev_mode_missing:
+                self.status_label2.config(text="Update check unavailable (running from source).")
+                if not silent:
+                    messagebox.showinfo(
+                        "Not yet built",
+                        "Checking for updates requires the compiled DECIMER engine, "
+                        "which doesn't exist yet because this is running from source, "
+                        "not as a built app. This is expected during development."
+                    )
+            else:
+                self.status_label2.config(text="Could not check for updates.")
+                if not silent:
+                    messagebox.showerror("Check for updates failed", result["error"])
+            return
 
         if result["installed"] is None:
+            self.status_label2.config(text="DECIMER not yet installed in this build.")
             if not silent:
-                self.status_label2.config(text="DECIMER not yet installed in this build.")
+                messagebox.showwarning("Not installed", "DECIMER is not installed in this build.")
             return
 
         if result["update_available"]:
@@ -1096,9 +2183,9 @@ class OpsinatorApp:
             if not silent:
                 messagebox.showinfo(
                     "Update available",
-                    msg + "\n\nThis app cannot update itself automatically. "
-                          "Ask your sysadmin to rebuild OPSINator with the "
-                          "newer decimer package version when convenient."
+                    msg + "\n\nThis app cannot update itself automatically - the engine "
+                          "would need to be rebuilt with the newer decimer package first. "
+                          "Ask your sysadmin to rebuild OPSINator when convenient."
                 )
         else:
             self.status_label2.config(text=f"DECIMER engine up to date (v{result['installed']}).")
@@ -1110,18 +2197,26 @@ class OpsinatorApp:
     def _build_ui(self):
         """Builds the two-tab layout (Name -> Structure, Image -> Structure)
         plus the thin status bar along the very bottom of the window."""
+        # Give all Treeview column headers a groove relief so vertical
+        # dividers are visible between adjacent heading cells - without
+        # this, the default flat style makes column boundaries ambiguous.
+        ttk.Style().configure("Treeview.Heading", relief="groove")
+
         # ttk.Notebook is tkinter's "tabbed panel" widget - each tab is
         # really just a regular Frame that gets shown or hidden.
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=8, pady=8)
 
-        name_tab = tk.Frame(notebook)
-        image_tab = tk.Frame(notebook)
-        notebook.add(name_tab, text="Name -> Structure")
-        notebook.add(image_tab, text="Image -> Structure")
+        name_tab     = tk.Frame(notebook)
+        image_tab    = tk.Frame(notebook)
+        activity_tab = tk.Frame(notebook)
+        notebook.add(name_tab,     text="Name -> Structure")
+        notebook.add(image_tab,    text="Image -> Structure")
+        notebook.add(activity_tab, text="Patent Activity")
 
         self._build_name_tab(name_tab)
         self._build_image_tab(image_tab)
+        self._build_activity_tab(activity_tab)
 
         self.status_label2 = tk.Label(self.root, text="", anchor="w", fg="#555555")
         self.status_label2.pack(fill="x", padx=10, pady=(0, 6))
@@ -1193,7 +2288,7 @@ class OpsinatorApp:
                     "smiles": "SMILES", "inchikey": "InChIKey", "message": "Message"}
         widths = {"name": 230, "status": 80, "smiles": 200, "inchikey": 140, "message": 200}
         for col in columns:
-            self.tree.heading(col, text=headings[col])
+            self.tree.heading(col, text=headings[col], anchor="w")
             self.tree.column(col, width=widths[col], anchor="w")
 
         vsb = ttk.Scrollbar(parent, orient="vertical", command=self.tree.yview)
@@ -1215,15 +2310,76 @@ class OpsinatorApp:
                               "(e.g. a screenshot or crop from a patent figure).",
                  wraplength=600, justify="left").pack(anchor="w", **pad)
 
+        # --- the gating checkbox: nothing below it is usable until this
+        # is checked, and checking it for the first time shows a clear
+        # size warning before anything downloads. ---
+        gate_frame = tk.Frame(parent)
+        gate_frame.pack(fill="x", **pad)
+
+        self.decimer_enabled_var = tk.BooleanVar(value=is_decimer_enabled())
+        self.decimer_gate_check = tk.Checkbutton(
+            gate_frame,
+            text="Enable image recognition (DECIMER) - downloads approximately "
+                 "700 MB-2 GB of components the first time it's actually used",
+            variable=self.decimer_enabled_var,
+            command=self.on_toggle_decimer_gate,
+        )
+        self.decimer_gate_check.pack(anchor="w")
+
+        gate_on = is_decimer_enabled()
+        decimer_btn_row = tk.Frame(gate_frame)
+        decimer_btn_row.pack(anchor="w", pady=(6, 0))
+
+        self.download_decimer_btn = tk.Button(
+            decimer_btn_row, text="Begin Download (DECIMER components)",
+            command=self.on_download_decimer,
+            state="normal" if gate_on else "disabled",
+        )
+        self.download_decimer_btn.pack(side="left")
+
+        self.check_updates_image_btn = tk.Button(
+            decimer_btn_row, text="Check for Updates",
+            command=self._check_for_updates_manual,
+            state="normal" if gate_on else "disabled",
+        )
+        self.check_updates_image_btn.pack(side="left", padx=(8, 0))
+
+        # Hide the consent checkbox and Begin Download button once the
+        # components are confirmed present on disk. Check for Updates
+        # stays visible in both cases. pack_forget removes the widgets
+        # from the layout entirely so no dead space is left behind.
+        if _decimer_components_present():
+            self.decimer_gate_check.pack_forget()
+            self.download_decimer_btn.pack_forget()
+
         btn_row = tk.Frame(parent)
         btn_row.pack(fill="x", **pad)
 
-        tk.Button(btn_row, text="Choose Image...", command=self.on_choose_image,
-                  width=16).pack(side="left", padx=(0, 8))
+        gate_on = self.decimer_enabled_var.get()
+        self.choose_image_btn = tk.Button(btn_row, text="Choose Image...", command=self.on_choose_image,
+                  width=16, state="normal" if gate_on else "disabled")
+        self.choose_image_btn.pack(side="left", padx=(0, 8))
+        self.choose_pdf_btn = tk.Button(btn_row, text="Choose PDF...", command=self.on_choose_pdf,
+                  width=14, state="normal" if gate_on else "disabled")
+        self.choose_pdf_btn.pack(side="left", padx=(0, 8))
         self.recognize_btn = tk.Button(btn_row, text="Recognize Structure",
                                         command=self.on_recognize_image, width=18,
                                         state="disabled")
         self.recognize_btn.pack(side="left", padx=(0, 8))
+
+        # A visible drop zone for dragging an image or PDF straight onto
+        # the window, as an alternative to the buttons above. Requires
+        # the tkinterdnd2 package - if it isn't available for some
+        # reason, this area still displays normally, it just won't
+        # accept drops (the buttons above still work either way).
+        self.drop_zone = tk.Label(
+            parent,
+            text="...or drag an image or PDF here...",
+            relief="ridge", borderwidth=2,
+            fg="#777777", height=2,
+        )
+        self.drop_zone.pack(fill="x", padx=10, pady=(0, 6))
+        self._wire_up_drag_and_drop()
 
         self.image_path_label = tk.Label(parent, text="No image selected.", fg="#555555")
         self.image_path_label.pack(anchor="w", padx=10)
@@ -1242,16 +2398,49 @@ class OpsinatorApp:
         self.image_progress = ttk.Progressbar(wait_frame, mode="indeterminate")
         self.image_progress.pack(fill="x", pady=(4, 0))
 
-        # A persistent table of everything recognized so far this
-        # session, so results don't disappear the moment you process a
-        # second image.
-        results_frame = tk.LabelFrame(parent, text="Recognized structures (this session)")
-        results_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        # Both scrollable tables live inside a PanedWindow so they share
+        # the remaining vertical space and the user can drag the divider.
+        tables_pane = tk.PanedWindow(parent, orient="vertical", sashrelief="raised",
+                                     sashwidth=6, opaqueresize=True)
+        tables_pane.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+
+        # --- Structures found in PDF ---
+        found_frame = tk.LabelFrame(tables_pane,
+                                    text="Structures found in PDF - select, then Recognize")
+        tables_pane.add(found_frame, stretch="always")
+
+        found_tree_frame = tk.Frame(found_frame)
+        found_tree_frame.pack(fill="both", expand=True, padx=8, pady=(6, 4))
+
+        self.found_tree = ttk.Treeview(found_tree_frame, columns=("label", "page"),
+                                        show="headings", height=10, selectmode="extended")
+        self.found_tree.heading("label", text="Label", anchor="w")
+        self.found_tree.heading("page", text="Page", anchor="center")
+        self.found_tree.column("label", width=420, anchor="w")
+        self.found_tree.column("page", width=80, anchor="center")
+        found_vsb = ttk.Scrollbar(found_tree_frame, orient="vertical",
+                                   command=self.found_tree.yview)
+        self.found_tree.configure(yscrollcommand=found_vsb.set)
+        self.found_tree.pack(side="left", fill="both", expand=True)
+        found_vsb.pack(side="right", fill="y")
+
+        found_btn_row = tk.Frame(found_frame)
+        found_btn_row.pack(fill="x", padx=8, pady=(0, 8))
+        self.select_all_found_btn = tk.Button(found_btn_row, text="Select All",
+                                               command=self.on_select_all_found, state="disabled")
+        self.select_all_found_btn.pack(side="left")
+        self.recognize_found_btn = tk.Button(found_btn_row, text="Recognize Selected/All Structures",
+                                              command=self.on_recognize_found, state="disabled")
+        self.recognize_found_btn.pack(side="left", padx=(8, 0))
+
+        # --- Recognized structures (this session) ---
+        results_frame = tk.LabelFrame(tables_pane, text="Recognized structures (this session)")
+        tables_pane.add(results_frame, stretch="always")
 
         img_columns = ("source", "smiles")
         self.image_tree = ttk.Treeview(results_frame, columns=img_columns, show="headings", height=8)
-        self.image_tree.heading("source", text="Image file")
-        self.image_tree.heading("smiles", text="Predicted SMILES")
+        self.image_tree.heading("source", text="Image file", anchor="w")
+        self.image_tree.heading("smiles", text="Predicted SMILES", anchor="w")
         self.image_tree.column("source", width=200, anchor="w")
         self.image_tree.column("smiles", width=360, anchor="w")
         img_vsb = ttk.Scrollbar(results_frame, orient="vertical", command=self.image_tree.yview)
@@ -1276,6 +2465,11 @@ class OpsinatorApp:
                                              state="disabled")
         self.image_save_sdf_btn.pack(side="left", padx=(0, 8))
 
+        self.image_save_mol_btn = tk.Button(img_btn_row, text="Save MOL",
+                                             command=self.on_save_image_mol, width=10,
+                                             state="disabled")
+        self.image_save_mol_btn.pack(side="left", padx=(0, 8))
+
         note = ("Note: image recognition runs locally using the DECIMER model. The first "
                 "time this is used on a machine, required components (roughly 1-2 GB) are "
                 "downloaded automatically into your own user profile - no admin rights needed. "
@@ -1283,6 +2477,74 @@ class OpsinatorApp:
                 "against the source image before relying on them.")
         tk.Label(parent, text=note, wraplength=600, justify="left",
                  fg="#777777", font=("Segoe UI", 8)).pack(anchor="w", padx=10, pady=(0, 10))
+
+    def _build_activity_tab(self, parent):
+        """Builds the Patent Activity tab: load a patent PDF, extract its activity
+        table, convert compound names to SMILES via OPSIN, and display results."""
+        pad = {"padx": 10, "pady": 6}
+
+        tk.Label(parent,
+                 text="Extract compounds with biological data from a patent PDF "
+                      "(activity table → compound names → OPSIN → SMILES).",
+                 wraplength=600, justify="left").pack(anchor="w", **pad)
+
+        btn_row = tk.Frame(parent)
+        btn_row.pack(fill="x", **pad)
+
+        self.activity_load_btn = tk.Button(btn_row, text="Load Patent PDF...",
+                                           command=self.on_activity_load, width=18)
+        self.activity_load_btn.pack(side="left", padx=(0, 8))
+
+        self.activity_run_btn = tk.Button(btn_row, text="Extract & Convert",
+                                          command=self.on_activity_run, width=16,
+                                          state="disabled")
+        self.activity_run_btn.pack(side="left", padx=(0, 8))
+
+        self.activity_save_btn = tk.Button(btn_row, text="Save CSV",
+                                           command=self.on_activity_save_csv, width=10,
+                                           state="disabled")
+        self.activity_save_btn.pack(side="left", padx=(0, 8))
+
+        self.activity_pdf_label = tk.Label(parent, text="No PDF loaded.", fg="#555555")
+        self.activity_pdf_label.pack(anchor="w", padx=10)
+
+        self.activity_status_label = tk.Label(parent, text="", fg="#555555")
+        self.activity_status_label.pack(anchor="w", padx=10)
+
+        self.activity_progress = ttk.Progressbar(parent, mode="determinate")
+        self.activity_progress.pack(fill="x", padx=10, pady=(2, 4))
+
+        tree_frame = tk.Frame(parent)
+        tree_frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+
+        cols = ("example", "name", "ic50", "smiles", "status", "page")
+        self.activity_tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
+        self.activity_tree.heading("example", text="Example #",    anchor="w")
+        self.activity_tree.heading("name",    text="Compound Name", anchor="w")
+        self.activity_tree.heading("ic50",    text="IC50 (nM)",    anchor="w")
+        self.activity_tree.heading("smiles",  text="SMILES",       anchor="w")
+        self.activity_tree.heading("status",  text="Status",       anchor="w")
+        self.activity_tree.heading("page",    text="Page",         anchor="center")
+        self.activity_tree.column("example", width=70,  minwidth=50,  anchor="w", stretch=False)
+        self.activity_tree.column("name",    width=380, minwidth=150, anchor="w", stretch=True)
+        self.activity_tree.column("ic50",    width=70,  minwidth=50,  anchor="w", stretch=False)
+        self.activity_tree.column("smiles",  width=300, minwidth=100, anchor="w", stretch=True)
+        self.activity_tree.column("status",  width=80,  minwidth=60,  anchor="w", stretch=False)
+        self.activity_tree.column("page",    width=50,  minwidth=40,  anchor="center", stretch=False)
+
+        act_vsb = ttk.Scrollbar(tree_frame, orient="vertical",
+                                 command=self.activity_tree.yview)
+        act_hsb = ttk.Scrollbar(parent, orient="horizontal",
+                                 command=self.activity_tree.xview)
+        self.activity_tree.configure(yscrollcommand=act_vsb.set,
+                                      xscrollcommand=act_hsb.set)
+        self.activity_tree.pack(side="left", fill="both", expand=True)
+        act_vsb.pack(side="right", fill="y")
+        act_hsb.pack(fill="x", padx=10, pady=(0, 4))
+
+        self._activity_pdf_path = None
+        self._activity_results  = []
+        self._activity_queue    = queue.Queue()
 
     # ---------------- name tab handlers ----------------
     # CONCEPT: functions named "on_something" (a common GUI convention)
@@ -1372,14 +2634,19 @@ class OpsinatorApp:
         OPSIN result and places a small message into the thread-safe
         queue, rather than touching any GUI widget directly (which would
         not be safe from a background thread)."""
+        smiles_in_batch = False
         for i, name in enumerate(names, start=1):
-            # CONCEPT: enumerate(names, start=1) walks through the list
-            # while also handing you a running count, starting at 1
-            # instead of the default 0 - handy for "item 1 of 5" style
-            # progress messages.
-            result = fetch_opsin(name)
+            if _looks_like_smiles(name):
+                result = {
+                    "name": name, "status": "ERROR",
+                    "smiles": "", "inchikey": "",
+                    "message": "Looks like SMILES, not a name",
+                }
+                smiles_in_batch = True
+            else:
+                result = fetch_opsin(name)
             self.ui_queue.put(("row", i, len(names), result))
-        self.ui_queue.put(("done", len(names)))
+        self.ui_queue.put(("done", len(names), smiles_in_batch))
 
     def _poll_queue(self):
         """Runs on the MAIN thread, roughly 10 times a second (every
@@ -1421,6 +2688,7 @@ class OpsinatorApp:
 
                 elif kind == "done":
                     total = msg[1]
+                    smiles_in_batch = msg[2] if len(msg) > 2 else False
                     # CONCEPT: `sum(1 for r in self.results if ...)` is a
                     # "generator expression" - very similar to a list
                     # comprehension, but it produces values one at a time
@@ -1440,6 +2708,11 @@ class OpsinatorApp:
                     self.save_sdf_btn.config(state="normal" if has_results else "disabled")
                     self.is_processing = False
                     self.anim.idle_frame(caption="Finished")
+                    if smiles_in_batch:
+                        messagebox.showwarning(
+                            "Wrong input type",
+                            "Doh! Need a chemical name, not SMILES."
+                        )
         except queue.Empty:
             pass  # nothing left to process right now - that's fine, just move on
 
@@ -1456,9 +2729,11 @@ class OpsinatorApp:
             defaultextension=".csv",
             filetypes=[("CSV files", "*.csv")],
             initialfile="opsin_results.csv",
+            initialdir=self.last_directory,
         )
         if not path:
             return  # user clicked Cancel on the save dialog
+        self._remember_directory(path)
 
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
@@ -1472,49 +2747,137 @@ class OpsinatorApp:
         except Exception as e:
             messagebox.showerror("Error saving file", str(e))
 
+    def _ensure_rdkit_then(self, on_ready, status_label, progress_bar=None):
+        """Loads RDKit (installing it automatically first, if needed) on
+        a BACKGROUND thread, so a real pip install never freezes the
+        window - then calls on_ready() back on the MAIN thread once
+        it's confirmed working, or shows a clear error if it couldn't be."""
+        if self.mol_converter.is_loaded():
+            on_ready()
+            return
+
+        def status(msg):
+            self.root.after(0, lambda: status_label.config(text=msg))
+
+        if progress_bar:
+            self.root.after(0, lambda: progress_bar.config(mode="indeterminate"))
+            self.root.after(0, lambda: progress_bar.start(12))
+
+        def worker():
+            self.mol_converter.ensure_loaded(status_callback=status)
+
+            def finish():
+                if progress_bar:
+                    progress_bar.stop()
+                if self.mol_converter.load_error:
+                    status_label.config(text="")
+                    messagebox.showerror("Chemistry toolkit unavailable",
+                                          f"Could not load RDKit: {self.mol_converter.load_error}")
+                else:
+                    status_label.config(text="")
+                    on_ready()
+
+            self.root.after(0, finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _remember_directory(self, path):
+        """Updates and persists the last-used folder, given either a
+        file path (in which case its containing folder is remembered)
+        or a folder path directly."""
+        folder = path if os.path.isdir(path) else os.path.dirname(path)
+        if folder and os.path.isdir(folder):
+            self.last_directory = folder
+            save_settings({"last_directory": folder})
+
     def on_save_mol(self):
-        """Saves a single structure file (.mol) for the currently
-        selected row in the table. MOL files hold exactly one structure -
-        use Save SDF for the whole batch."""
-        selected = self.tree.selection()  # returns a tuple of selected row IDs
-        if not selected:
-            messagebox.showinfo("Select a row", "Click a row in the table first, then Save MOL.")
+        """Saves either the currently selected row, or ALL results, as
+        MOL file(s) - the user explicitly chooses which, rather than
+        this only ever working on a single selected row."""
+        usable = [r for r in self.results if r.get("smiles") and r["status"] in ("SUCCESS", "WARNING")]
+        if not usable:
+            messagebox.showwarning("Nothing to export", "None of the results have a usable structure.")
             return
 
-        # tree.item(row_id, "values") gives back the same tuple of values
-        # we originally inserted for that row.
-        values = self.tree.item(selected[0], "values")
-        name, status, smiles = values[0], values[1], values[2]
-        if not smiles:
-            messagebox.showwarning("No structure", f"'{name}' has no SMILES to convert "
-                                                     f"(status: {status}).")
+        selected = self.tree.selection()
+
+        scope = ask_save_scope(self.root, len(usable))
+        if scope is None:
+            return
+        if scope == "selected" and not selected:
+            messagebox.showinfo("Select a row", "Click a row in the table first, then try again.")
             return
 
-        self.mol_converter.ensure_loaded()
-        if self.mol_converter.load_error:
-            messagebox.showerror("Chemistry toolkit unavailable",
-                                  f"Could not load RDKit: {self.mol_converter.load_error}")
-            return
+        def proceed():
+            if scope == "selected":
+                values = self.tree.item(selected[0], "values")
+                name, status, smiles = values[0], values[1], values[2]
+                if not smiles:
+                    messagebox.showwarning("No structure", f"'{name}' has no SMILES to convert "
+                                                             f"(status: {status}).")
+                    return
+                try:
+                    molblock = self.mol_converter.smiles_to_molblock(smiles, title=name)
+                except Exception as e:
+                    messagebox.showerror("Conversion failed", str(e))
+                    return
 
-        try:
-            molblock = self.mol_converter.smiles_to_molblock(smiles, title=name)
-        except Exception as e:
-            messagebox.showerror("Conversion failed", str(e))
-            return
+                path = filedialog.asksaveasfilename(
+                    defaultextension=".mol",
+                    filetypes=[("MOL files", "*.mol")],
+                    initialfile="structure.mol",
+                    initialdir=self.last_directory,
+                )
+                if not path:
+                    return
+                self._remember_directory(path)
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(molblock)
+                    messagebox.showinfo("Saved", f"Structure saved to:\n{path}")
+                except Exception as e:
+                    messagebox.showerror("Error saving file", str(e))
 
-        path = filedialog.asksaveasfilename(
-            defaultextension=".mol",
-            filetypes=[("MOL files", "*.mol")],
-            initialfile="structure.mol",
-        )
-        if not path:
-            return
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(molblock)
-            messagebox.showinfo("Saved", f"Structure saved to:\n{path}")
-        except Exception as e:
-            messagebox.showerror("Error saving file", str(e))
+            else:  # scope == "all"
+                folder = filedialog.askdirectory(title="Choose a folder for the MOL files",
+                                                  initialdir=self.last_directory)
+                if not folder:
+                    return
+                self._remember_directory(folder)
+
+                saved_count = 0
+                failed_names = []
+                used_filenames = set()
+                for r in usable:
+                    try:
+                        molblock = self.mol_converter.smiles_to_molblock(r["smiles"], title=r["name"])
+                    except Exception:
+                        failed_names.append(r["name"])
+                        continue
+
+                    base = sanitize_filename(r["name"])
+                    filename = f"{base}.mol"
+                    # Two different results could sanitize down to the same
+                    # name - number them rather than silently overwriting.
+                    counter = 2
+                    while filename in used_filenames:
+                        filename = f"{base}_{counter}.mol"
+                        counter += 1
+                    used_filenames.add(filename)
+
+                    try:
+                        with open(os.path.join(folder, filename), "w", encoding="utf-8") as f:
+                            f.write(molblock)
+                        saved_count += 1
+                    except Exception:
+                        failed_names.append(r["name"])
+
+                note = f"{saved_count} structure(s) saved to:\n{folder}"
+                if failed_names:
+                    note += f"\n\n{len(failed_names)} could not be converted and were skipped."
+                messagebox.showinfo("Saved", note)
+
+        self._ensure_rdkit_then(proceed, self.status_label, self.progress)
 
     def on_save_sdf(self):
         """Saves every successfully-converted result as one multi-record
@@ -1525,102 +2888,544 @@ class OpsinatorApp:
             messagebox.showwarning("Nothing to export", "None of the results have a usable structure.")
             return
 
-        self.mol_converter.ensure_loaded()
-        if self.mol_converter.load_error:
-            messagebox.showerror("Chemistry toolkit unavailable",
-                                  f"Could not load RDKit: {self.mol_converter.load_error}")
-            return
+        def proceed():
+            records = []
+            failed_conversions = []
+            for r in usable:
+                try:
+                    molblock = self.mol_converter.smiles_to_molblock(r["smiles"], title=r["name"])
+                    records.append((molblock, {
+                        "Source name": r["name"],
+                        "Status": r["status"],
+                        "InChIKey": r["inchikey"],
+                    }))
+                except Exception:
+                    # If one structure fails to convert, don't let it ruin
+                    # the whole export - just remember its name and continue
+                    # with the rest of the batch.
+                    failed_conversions.append(r["name"])
 
-        records = []
-        failed_conversions = []
-        for r in usable:
+            if not records:
+                messagebox.showwarning("Nothing to export", "None of the results could be converted.")
+                return
+
+            path = filedialog.asksaveasfilename(
+                defaultextension=".sdf",
+                filetypes=[("SDF files", "*.sdf")],
+                initialfile="opsin_results.sdf",
+                initialdir=self.last_directory,
+            )
+            if not path:
+                return
+            self._remember_directory(path)
             try:
-                molblock = self.mol_converter.smiles_to_molblock(r["smiles"], title=r["name"])
-                records.append((molblock, {
-                    "Source name": r["name"],
-                    "Status": r["status"],
-                    "InChIKey": r["inchikey"],
-                }))
-            except Exception:
-                # If one structure fails to convert, don't let it ruin
-                # the whole export - just remember its name and continue
-                # with the rest of the batch.
-                failed_conversions.append(r["name"])
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(build_sdf(records))
+                note = f"{len(records)} structure(s) saved to:\n{path}"
+                if skipped or failed_conversions:
+                    note += f"\n\n{skipped + len(failed_conversions)} row(s) were skipped (no usable structure)."
+                messagebox.showinfo("Saved", note)
+            except Exception as e:
+                messagebox.showerror("Error saving file", str(e))
 
-        if not records:
-            messagebox.showwarning("Nothing to export", "None of the results could be converted.")
-            return
-
-        path = filedialog.asksaveasfilename(
-            defaultextension=".sdf",
-            filetypes=[("SDF files", "*.sdf")],
-            initialfile="opsin_results.sdf",
-        )
-        if not path:
-            return
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(build_sdf(records))
-            note = f"{len(records)} structure(s) saved to:\n{path}"
-            if skipped or failed_conversions:
-                note += f"\n\n{skipped + len(failed_conversions)} row(s) were skipped (no usable structure)."
-            messagebox.showinfo("Saved", note)
-        except Exception as e:
-            messagebox.showerror("Error saving file", str(e))
+        self._ensure_rdkit_then(proceed, self.status_label, self.progress)
 
     # ---------------- image tab handlers ----------------
 
-    def on_choose_image(self):
-        """Opens a file-picker dialog, remembers the chosen image path,
-        and shows a small preview thumbnail."""
-        path = filedialog.askopenfilename(
-            title="Choose a chemical structure image",
-            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.gif"), ("All files", "*.*")],
-        )
-        if not path:
-            return
+    def _update_progress_from_status(self, line):
+        """Looks for something like '42%' inside a status line. If
+        found, switches the progress bar to determinate mode and sets
+        it to that exact value - so it visibly fills up to match real
+        progress, instead of just bouncing back and forth indefinitely.
+        If no percentage is found (e.g. 'Extracting model...'), leaves
+        it bouncing, since that step's duration genuinely isn't known.
+        """
+        match = re.search(r"(\d{1,3})%", line)
+        if match:
+            percent = min(100, int(match.group(1)))
+            if str(self.image_progress["mode"]) != "determinate":
+                self.image_progress.stop()
+                self.image_progress.config(mode="determinate", maximum=100)
+            self.image_progress["value"] = percent
+        else:
+            if str(self.image_progress["mode"]) != "indeterminate":
+                self.image_progress.config(mode="indeterminate")
+            self.image_progress.start(12)
 
-        self.current_image_path = path
-        self.image_path_label.config(text=os.path.basename(path))
+    def _finish_progress_bar(self, success):
+        """Called once a task is fully done. On success, the bar fills
+        all the way to the right rather than just stopping mid-bounce -
+        so 'complete' actually looks complete. On failure, it resets to
+        empty instead, since nothing was actually finished."""
+        self.image_progress.stop()
+        self.image_progress.config(mode="determinate", maximum=100)
+        self.image_progress["value"] = 100 if success else 0
+
+    def on_toggle_decimer_gate(self):
+        """Called whenever the 'Enable image recognition' checkbox is
+        clicked. Shows a clear size warning the first time it's turned
+        on, and enables/disables the Choose Image/Choose PDF buttons
+        accordingly."""
+        if self.decimer_enabled_var.get():
+            # User just checked it. If they've never confirmed this
+            # before, show the warning before actually turning it on.
+            if not is_decimer_enabled():
+                confirmed = messagebox.askyesno(
+                    "Enable image recognition?",
+                    "Image recognition (DECIMER) requires downloading "
+                    "approximately 700 MB-2 GB of components the first "
+                    "time you actually recognize an image. This happens "
+                    "once and is saved for future use.\n\n"
+                    "Continue?",
+                )
+                if not confirmed:
+                    # They backed out - leave it unchecked and disabled.
+                    self.decimer_enabled_var.set(False)
+                    self.choose_image_btn.config(state="disabled")
+                    self.choose_pdf_btn.config(state="disabled")
+                    self.download_decimer_btn.config(state="disabled")
+                    self.check_updates_image_btn.config(state="disabled")
+                    return
+                mark_decimer_enabled()
+            self.choose_image_btn.config(state="normal")
+            self.choose_pdf_btn.config(state="normal")
+            self.download_decimer_btn.config(state="normal")
+            self.check_updates_image_btn.config(state="normal")
+        else:
+            # User unchecked it - remember that choice, and disable the
+            # controls so nothing can be triggered accidentally.
+            mark_decimer_disabled()
+            self.choose_image_btn.config(state="disabled")
+            self.choose_pdf_btn.config(state="disabled")
+            self.download_decimer_btn.config(state="disabled")
+            self.check_updates_image_btn.config(state="disabled")
+            self.recognize_btn.config(state="disabled")
+
+    def on_download_decimer(self):
+        """Runs the engine's explicit --download command as its own
+        deliberate action, separate from recognition. Safe to click
+        even if everything is already downloaded - it finishes almost
+        instantly in that case rather than re-downloading anything."""
+        if self.decimer._engine_path is None:
+            self._show_engine_unavailable("Downloading DECIMER components")
+            return
+        self.download_decimer_btn.config(state="disabled")
+        self.image_progress.config(mode="indeterminate")
+        self.image_progress.start(12)
+        self.image_status_label.config(text="Starting download...")
+        threading.Thread(target=self._run_decimer_download, daemon=True).start()
+
+    def _run_decimer_download(self):
+        """Runs on the BACKGROUND thread. Streams the engine's live
+        download progress lines straight into the status label, the
+        same pattern used for recognition itself."""
+        def status(msg):
+            self.root.after(0, lambda: self.image_status_label.config(text=msg))
+            self.root.after(0, lambda: self._update_progress_from_status(msg))
+
+        process = subprocess.Popen(
+            [*self.decimer._invoke_prefix, self.decimer._engine_path, "--download"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        completed = False
+        other_lines = []
+        for line in process.stdout:
+            line = line.rstrip("\n")
+            if line == "OPSINATOR_DOWNLOAD_COMPLETE":
+                completed = True
+            elif line and not _is_harmless_startup_noise(line):
+                other_lines.append(line)
+                status(line)
+
+        process.wait(timeout=3600)  # a full multi-GB download can genuinely take a while
+
+        if process.returncode == 0 and completed:
+            self.root.after(0, lambda: self._decimer_download_done())
+        else:
+            error_text = "\n".join(other_lines[-10:]) or "Download failed for an unknown reason."
+            self.root.after(0, lambda err=error_text: self._decimer_download_done(error=err))
+
+    def _decimer_download_done(self, error=None):
+        self._finish_progress_bar(success=not error)
+        self.download_decimer_btn.config(state="normal")
+        if error:
+            self.image_status_label.config(text="Download failed.")
+            messagebox.showerror("Download failed", error)
+        else:
+            self.image_status_label.config(text="DECIMER components ready.")
+            messagebox.showinfo("Download complete", "DECIMER components are ready to use.")
+
+    def on_choose_image(self):
+        """Opens a file-picker dialog that allows selecting MULTIPLE
+        images at once (up to the app's normal 200-entry batch size),
+        remembers the last folder used, and shows a preview of the
+        first one plus a count of how many were chosen."""
+        paths = filedialog.askopenfilenames(
+            title="Choose chemical structure image(s) - multiple selection allowed",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.gif"), ("All files", "*.*")],
+            initialdir=self.last_directory,
+        )
+        if not paths:
+            return
+        self._remember_directory(paths[0])
+        self._set_current_images(list(paths))
+
+    def _set_current_images(self, paths):
+        """Shared by the file-picker and drag-and-drop. paths is always
+        a list now, even when it's just one image, so the rest of the
+        app only has to handle one case."""
+        self.current_image_paths = paths
+        if len(paths) == 1:
+            self.image_path_label.config(text=os.path.basename(paths[0]))
+        else:
+            self.image_path_label.config(text=f"{len(paths)} images selected")
         self.recognize_btn.config(state="normal")
 
         try:
-            img = tk.PhotoImage(file=path)
+            img = tk.PhotoImage(file=paths[0])
             max_dim = 220
             w, h = img.width(), img.height()
-            # `.subsample(n, n)` shrinks an image by keeping only every
-            # nth pixel in each direction - a simple (if a little crude)
-            # way to make a quick thumbnail without extra libraries.
             factor = max(1, int(max(w, h) / max_dim))
             if factor > 1:
                 img = img.subsample(factor, factor)
             self.image_preview_label.config(image=img, text="")
-            # CONCEPT: tkinter doesn't keep its own reference to images,
-            # so if we don't store `img` somewhere (here, as an attribute
-            # on the label widget itself), Python's garbage collector
-            # would clean it up and the picture would vanish from screen.
-            # Assigning it to `.image` is the standard workaround.
             self.image_preview_label.image = img
         except Exception:
             self.image_preview_label.config(image="", text="(preview unavailable for this file type)")
 
+    def on_choose_pdf(self):
+        """Opens a file-picker dialog for a PDF, then runs the full
+        pipeline: render every page -> find structures on each page ->
+        recognize each one."""
+        path = filedialog.askopenfilename(
+            title="Choose a PDF document",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+            initialdir=self.last_directory,
+        )
+        if not path:
+            return
+        self._remember_directory(path)
+        self._start_pdf_scan(path)
+
+    def _wire_up_drag_and_drop(self):
+        """Registers the drop zone to accept dragged files, if the
+        tkinterdnd2 package is available. If it isn't, the drop zone
+        just sits there as a (non-functional) label - the Choose Image
+        and Choose PDF buttons still work regardless."""
+        if not _DND_AVAILABLE:
+            self.drop_zone.config(text="(drag-and-drop unavailable - use the buttons above)")
+            return
+        self.drop_zone.drop_target_register(DND_FILES)
+        self.drop_zone.dnd_bind("<<Drop>>", self.on_file_dropped)
+
+    def on_file_dropped(self, event):
+        """Called when files are dropped onto the drop zone. If any of
+        them is a PDF, processes the first PDF found (one at a time,
+        since each runs the full page-by-page pipeline). Otherwise,
+        treats everything dropped as a batch of images."""
+        # CONCEPT: dropped file paths arrive as a Tcl-formatted list
+        # (paths with spaces get wrapped in curly braces) - splitlist()
+        # is the correct way to parse that format back into a normal
+        # Python list of plain strings.
+        paths = list(self.root.tk.splitlist(event.data))
+        if not paths:
+            return
+
+        pdf_paths = [p for p in paths if p.lower().endswith(".pdf")]
+        if pdf_paths:
+            self._start_pdf_scan(pdf_paths[0])
+        else:
+            self._remember_directory(paths[0])
+            self._set_current_images(paths)
+
+    def _start_pdf_scan(self, pdf_path):
+        """Stage 1: finds every structure in the PDF (rendering pages,
+        running Segmentation) but does NOT recognize any of them yet.
+        Recognition is a separate, deliberate step the user triggers
+        afterward, on whichever found structures they actually want."""
+        if self.segmentation.dev_mode_missing:
+            messagebox.showinfo(
+                "Not yet built",
+                "PDF scanning requires the compiled Segmentation engine, which "
+                "doesn't exist yet because this is running from source, not as "
+                "a built app. This is expected during development."
+            )
+            return
+        if self.segmentation.load_error:
+            messagebox.showerror("Not available", self.segmentation.load_error)
+            return
+
+        # Clear out any structures found by a previous scan, and their
+        # scratch files - this scan replaces that one.
+        self._cleanup_pdf_scratch_dir()
+        for row in self.found_tree.get_children():
+            self.found_tree.delete(row)
+        self.found_structures = []
+        self.recognize_found_btn.config(state="disabled")
+        self.select_all_found_btn.config(state="disabled")
+
+        self.pdf_source_name = os.path.basename(pdf_path)
+        self.image_status_label.config(text="Scanning for structures...")
+        self.image_progress.config(mode="indeterminate")
+        self.image_progress.start(12)
+        self.choose_image_btn.config(state="disabled")
+        self.choose_pdf_btn.config(state="disabled")
+        threading.Thread(target=self._run_pdf_scan, args=(pdf_path,), daemon=True).start()
+
+    def _run_pdf_scan(self, pdf_path):
+        """Runs on the BACKGROUND thread. Renders every page, then runs
+        Segmentation ONCE across the whole batch of pages (not once per
+        page - see find_all_structures for why that distinction matters
+        for anything beyond a couple of pages). Each structure is
+        streamed to the GUI immediately as it is found."""
+        def status(msg):
+            self.root.after(0, lambda: self.image_status_label.config(text=msg))
+
+        try:
+            # mkdtemp (not the `with tempfile.TemporaryDirectory()`
+            # context-manager form) is used deliberately here: the crop
+            # files need to keep existing AFTER this function returns,
+            # so the user can come back later and choose to recognize
+            # them - a context manager would delete them immediately.
+            scratch_dir = tempfile.mkdtemp(prefix="opsinator_pdf_")
+            self.pdf_scratch_dir = scratch_dir
+
+            status("Scanning for structures...")
+            page_dir = os.path.join(scratch_dir, "pages")
+            page_paths = render_pdf_pages_to_images(pdf_path, page_dir, status_callback=status)
+            pdf_basename = os.path.splitext(os.path.basename(pdf_path))[0]
+
+            if not self.segmentation.is_loaded():
+                raise RuntimeError(self.segmentation.load_error or "Segmentation engine not available")
+
+            crop_dir = os.path.join(scratch_dir, "crops")
+
+            def on_structure(structure):
+                page_image_path = os.path.join(
+                    page_dir, f"{pdf_basename}_page_{structure['page']}.png")
+                label = find_label_near_bbox(
+                    pdf_path, structure["page"] - 1, structure["bbox"],
+                    page_image_path=page_image_path)
+                item = {
+                    "page": structure["page"],
+                    "crop_path": structure["crop_path"],
+                    "label": label,
+                }
+                self.root.after(0, lambda it=item: self._stream_found_structure(it))
+
+            self.segmentation.find_all_structures(
+                page_dir, crop_dir, total_pages=len(page_paths),
+                on_structure_found=on_structure)
+
+            self.root.after(0, self._pdf_scan_done)
+
+        except Exception as e:
+            self.root.after(0, lambda err=str(e): self._pdf_scan_done(error=err))
+
+    def _stream_found_structure(self, item):
+        """Runs on the MAIN thread for each structure as it is found
+        during scanning - inserts it into the tree immediately rather
+        than waiting until the full scan completes."""
+        iid = str(len(self.found_structures))
+        item["_tree_iid"] = iid
+        self.found_structures.append(item)
+
+        label = item["label"]
+        display_label = label if label != "No label" else "No label (pending recognition)"
+        self.found_tree.insert("", "end", iid=iid, values=(display_label, item["page"]))
+
+        if len(self.found_structures) == 1:
+            self.recognize_found_btn.config(state="normal")
+            self.select_all_found_btn.config(state="normal")
+
+        self.image_status_label.config(
+            text=f"Found structure {label} on page {item['page']}")
+
+    def _pdf_scan_done(self, error=None):
+        """Runs on the MAIN thread once scanning has finished. By this
+        point every structure has already been streamed into the tree
+        by _stream_found_structure; this just finalizes the UI state."""
+        self.choose_image_btn.config(state="normal" if self.decimer_enabled_var.get() else "disabled")
+        self.choose_pdf_btn.config(state="normal" if self.decimer_enabled_var.get() else "disabled")
+
+        if error:
+            self._finish_progress_bar(success=False)
+            self.image_status_label.config(text="Scan failed.")
+            messagebox.showerror("PDF scan failed", error)
+            return
+
+        self._finish_progress_bar(success=True)
+        count = len(self.found_structures)
+        if count:
+            self.image_status_label.config(text=f"{count} structure(s) found.")
+            self.recognize_found_btn.config(state="normal")
+            self.select_all_found_btn.config(state="normal")
+        else:
+            self.image_status_label.config(text="No structures found in this document.")
+
+    def on_select_all_found(self):
+        self.found_tree.selection_set(self.found_tree.get_children())
+
+    def on_recognize_found(self):
+        """Recognizes whichever found structures are selected - or, if
+        none are selected, asks whether to recognize all of them rather
+        than silently doing nothing or silently doing everything."""
+        selected_ids = self.found_tree.selection()
+        if not selected_ids:
+            if not self.found_structures:
+                return
+            confirmed = messagebox.askyesno(
+                "Recognize all?",
+                f"No rows are selected. Recognize all {len(self.found_structures)} "
+                "found structure(s)?"
+            )
+            if not confirmed:
+                return
+            selected_ids = self.found_tree.get_children()
+
+        items = [self.found_structures[int(i)] for i in selected_ids]
+
+        self.recognize_found_btn.config(state="disabled")
+        self.image_progress.config(mode="indeterminate")
+        self.image_progress.start(12)
+        self.image_status_label.config(text="Preparing...")
+        threading.Thread(target=self._run_found_recognition, args=(items,), daemon=True).start()
+
+    def _run_found_recognition(self, items):
+        """Runs on the BACKGROUND thread. Recognizes only the specific
+        found structures passed in, adding each to the main results
+        table as it finishes."""
+        def status_cb(msg):
+            self.root.after(0, lambda: self.image_status_label.config(text=msg))
+            self.root.after(0, lambda: self._update_progress_from_status(msg))
+
+        if self.decimer.dev_mode_missing:
+            self.root.after(0, lambda: self._found_recognition_done(
+                dev_mode_note="Recognition requires the compiled DECIMER engine, which "
+                              "doesn't exist yet because this is running from source, not "
+                              "as a built app. This is expected during development."))
+            return
+        if self.decimer.load_error:
+            self.root.after(0, lambda: self._found_recognition_done(
+                error=f"Could not load image recognition engine: {self.decimer.load_error}"))
+            return
+
+        total = len(items)
+        for i, item in enumerate(items, start=1):
+            self.root.after(0, lambda i=i, total=total, page=item["page"]: self.image_status_label.config(
+                text=f"Recognizing {i} of {total} (page {page})..."))
+            label = item.get("label", "No label")
+            try:
+                smiles = self.decimer.predict(item["crop_path"], status_callback=status_cb)
+                # For unlabeled structures, try PubChem for an IUPAC name.
+                if smiles and (not label or label == "No label"):
+                    pubchem_name = _lookup_iupac_pubchem(smiles)
+                    if pubchem_name:
+                        label = pubchem_name
+                        iid = item.get("_tree_iid")
+                        if iid is not None:
+                            self.root.after(0, lambda iid=iid, n=pubchem_name:
+                                            self._update_found_label(iid, n))
+                if label and label != "No label":
+                    source_name = f"{label} | Page {item['page']}"
+                else:
+                    source_name = f"{self.pdf_source_name} - No label | Page {item['page']}"
+                self.root.after(0, lambda src=source_name, s=smiles: self._add_image_result(src, s))
+            except Exception as e:
+                if label and label != "No label":
+                    source_name = f"{label} | Page {item['page']}"
+                else:
+                    source_name = f"{self.pdf_source_name} - No label | Page {item['page']}"
+                self.root.after(0, lambda src=source_name, err=str(e): self._add_image_result(src, "", error=err))
+
+        self.root.after(0, lambda: self._found_recognition_done(total=total))
+
+    def _found_recognition_done(self, total=0, dev_mode_note=None, error=None):
+        self.recognize_found_btn.config(state="normal")
+        if dev_mode_note:
+            self._finish_progress_bar(success=False)
+            messagebox.showinfo("Not yet built", dev_mode_note)
+            return
+        if error:
+            self._finish_progress_bar(success=False)
+            self.image_status_label.config(text="Failed.")
+            messagebox.showerror("Recognition failed", error)
+            return
+        self._finish_progress_bar(success=True)
+        self.image_status_label.config(text=f"Done. Recognized {total} structure(s).")
+
+    def _update_found_label(self, iid: str, name: str):
+        """Updates the label shown in the found-structures tree row and
+        the in-memory list. Called on the MAIN thread after PubChem
+        returns an IUPAC name for a previously unlabeled structure."""
+        try:
+            self.found_tree.set(iid, column="label", value=name)
+        except Exception:
+            pass
+        try:
+            idx = int(iid)
+            if 0 <= idx < len(self.found_structures):
+                self.found_structures[idx]["label"] = name
+        except (ValueError, IndexError):
+            pass
+
+    def _cleanup_pdf_scratch_dir(self):
+        """Deletes the temporary folder holding the current scan's
+        rendered pages and crops, if one exists."""
+        if self.pdf_scratch_dir and os.path.isdir(self.pdf_scratch_dir):
+            shutil.rmtree(self.pdf_scratch_dir, ignore_errors=True)
+        self.pdf_scratch_dir = None
+
+    def _add_image_result(self, source_name, smiles, error=None):
+        """Adds one row to the persistent image-results table and list -
+        shared by the single-image flow, batch image flow, and the PDF
+        pipeline. If error is given, the row shows that instead of a
+        SMILES, so a failed item in a batch is visible, not silently
+        dropped."""
+        display_smiles = smiles or (f"(failed: {error})" if error else "")
+        record = {"source": source_name, "smiles": smiles or ""}
+        self.image_results.append(record)
+        self.image_tree.insert("", "end", values=(record["source"], display_smiles))
+
+        has_results = any(r.get("smiles") for r in self.image_results)
+        self.image_save_csv_btn.config(state="normal" if self.image_results else "disabled")
+        self.image_save_sdf_btn.config(state="normal" if has_results else "disabled")
+        self.image_save_mol_btn.config(state="normal" if has_results else "disabled")
+        self.copy_smiles_btn.config(state="normal" if has_results else "disabled")
+
     def on_recognize_image(self):
         """Starts image recognition on a background thread, the same way
         on_convert() does for the Name tab - so the (potentially slow,
-        first-run) DECIMER loading never freezes the window."""
-        if not self.current_image_path:
+        first-run) DECIMER loading never freezes the window. Processes
+        every selected image in sequence, not just one."""
+        if not self.current_image_paths:
             return
         self.recognize_btn.config(state="disabled")
+        self.image_progress.config(mode="indeterminate")
         self.image_progress.start(12)  # start the indeterminate "bouncing" animation
         self.image_status_label.config(text="Preparing...")
         threading.Thread(target=self._run_image_recognition, daemon=True).start()
 
     def _run_image_recognition(self):
-        """Runs on the BACKGROUND thread."""
+        """Runs on the BACKGROUND thread. Loops over every image that
+        was selected, adding each result to the table as it finishes -
+        one failed image doesn't stop the rest of the batch."""
         def status_cb(msg):
             # Same pattern as elsewhere: hop back to the main thread
             # before touching any widget.
             self.root.after(0, lambda: self.image_status_label.config(text=msg))
+            self.root.after(0, lambda: self._update_progress_from_status(msg))
+
+        if self.decimer.dev_mode_missing:
+            self.root.after(0, lambda: self._image_recognition_done(
+                dev_mode_note="Recognition requires the compiled DECIMER engine, which "
+                              "doesn't exist yet because this is running from source, not "
+                              "as a built app. This is expected during development."))
+            return
 
         if not self.decimer.is_loaded():
             self.decimer.ensure_loaded(status_callback=status_cb)
@@ -1630,51 +3435,155 @@ class OpsinatorApp:
                 error=f"Could not load image recognition engine: {self.decimer.load_error}"))
             return
 
-        self.root.after(0, lambda: self.image_status_label.config(text="Recognizing structure..."))
-        try:
-            smiles = self.decimer.predict(self.current_image_path)
-            self.root.after(0, lambda: self._image_recognition_done(smiles=smiles))
-        except Exception as e:
-            self.root.after(0, lambda: self._image_recognition_done(error=str(e)))
+        total = len(self.current_image_paths)
+        succeeded = 0
+        failed_names = []
 
-    def _image_recognition_done(self, smiles=None, error=None):
-        """Runs back on the MAIN thread (via root.after above) once
-        recognition has either succeeded or failed. Appends a successful
-        result to the persistent session list, rather than overwriting a
-        single field - so a second image doesn't erase the first one."""
-        self.image_progress.stop()
+        for i, path in enumerate(self.current_image_paths, start=1):
+            name = os.path.basename(path)
+            if total > 1:
+                self.root.after(0, lambda i=i, total=total, name=name: self.image_status_label.config(
+                    text=f"Recognizing {i} of {total}: {name}..."))
+            else:
+                self.root.after(0, lambda: self.image_status_label.config(text="Recognizing structure..."))
+
+            try:
+                smiles = self.decimer.predict(path, status_callback=status_cb)
+                self.root.after(0, lambda n=name, s=smiles: self._add_image_result(n, s))
+                succeeded += 1
+            except Exception as e:
+                failed_names.append(name)
+                self.root.after(0, lambda n=name, err=str(e): self._add_image_result(n, "", error=err))
+
+        self.root.after(0, lambda: self._image_recognition_done(
+            succeeded=succeeded, total=total, failed_names=failed_names))
+
+    def _image_recognition_done(self, succeeded=0, total=0, failed_names=None, dev_mode_note=None, error=None):
+        """Runs back on the MAIN thread (via root.after above) once the
+        whole batch has finished, succeeded or failed."""
         self.recognize_btn.config(state="normal")
+        if dev_mode_note:
+            self._finish_progress_bar(success=False)
+            self.image_status_label.config(text="Not available in source mode.")
+            messagebox.showinfo("Not yet built", dev_mode_note)
+            return
         if error:
+            self._finish_progress_bar(success=False)
             self.image_status_label.config(text="Failed.")
             messagebox.showerror("Recognition failed", error)
             return
-        self.image_status_label.config(text="Done.")
 
-        source_name = os.path.basename(self.current_image_path) if self.current_image_path else ""
-        record = {"source": source_name, "smiles": smiles or ""}
-        self.image_results.append(record)
-        self.image_tree.insert("", "end", values=(record["source"], record["smiles"]))
-
-        has_results = bool(self.image_results)
-        self.image_save_csv_btn.config(state="normal" if has_results else "disabled")
-        self.image_save_sdf_btn.config(state="normal" if has_results else "disabled")
-        self.copy_smiles_btn.config(state="normal" if has_results else "disabled")
+        self._finish_progress_bar(success=True)
+        if total > 1:
+            note = f"Done. {succeeded} of {total} recognized successfully."
+            if failed_names:
+                note += f" Failed: {', '.join(failed_names[:5])}" + ("..." if len(failed_names) > 5 else "")
+            self.image_status_label.config(text=note)
+        else:
+            self.image_status_label.config(text="Done." if not failed_names else "Failed.")
 
     def on_copy_smiles(self):
-        """Copies the SMILES from whichever row is selected in the image
-        results table - or, if nothing's selected, the most recently
-        recognized one - onto the clipboard."""
+        """Copies SMILES from every selected row in the image results
+        table (newline-separated when multiple are selected), or the
+        most recently recognized one if nothing is selected."""
         selected = self.image_tree.selection()
         if selected:
-            value = self.image_tree.item(selected[0], "values")[1]
+            smiles_list = [
+                self.image_tree.item(iid, "values")[1]
+                for iid in selected
+            ]
+            value = "\n".join(s for s in smiles_list if s and not s.startswith("(failed"))
         elif self.image_results:
-            value = self.image_results[-1]["smiles"]  # [-1] means "the last item in the list"
+            value = self.image_results[-1]["smiles"]
         else:
             return
         if not value:
             return
         self.root.clipboard_clear()
         self.root.clipboard_append(value)
+
+    def on_save_image_mol(self):
+        """Saves either the selected image result or all of them as MOL
+        file(s), using the same scope-choice dialog as the Name tab."""
+        usable = [r for r in self.image_results if r.get("smiles")]
+        if not usable:
+            messagebox.showwarning("Nothing to export", "No recognized structures to export.")
+            return
+
+        selected = self.image_tree.selection()
+
+        scope = ask_save_scope(self.root, len(usable))
+        if scope is None:
+            return
+        if scope == "selected" and not selected:
+            messagebox.showinfo("Select a row", "Click a row in the table first, then try again.")
+            return
+
+        def proceed():
+            if scope == "selected":
+                values = self.image_tree.item(selected[0], "values")
+                source, smiles = values[0], values[1]
+                if not smiles or smiles.startswith("(failed"):
+                    messagebox.showwarning("No structure", "The selected row has no usable SMILES.")
+                    return
+                try:
+                    molblock = self.mol_converter.smiles_to_molblock(smiles, title=source)
+                except Exception as e:
+                    messagebox.showerror("Conversion failed", str(e))
+                    return
+                path = filedialog.asksaveasfilename(
+                    defaultextension=".mol",
+                    filetypes=[("MOL files", "*.mol")],
+                    initialfile="structure.mol",
+                    initialdir=self.last_directory,
+                )
+                if not path:
+                    return
+                self._remember_directory(path)
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(molblock)
+                    messagebox.showinfo("Saved", f"Structure saved to:\n{path}")
+                except Exception as e:
+                    messagebox.showerror("Error saving file", str(e))
+
+            else:  # scope == "all"
+                folder = filedialog.askdirectory(title="Choose a folder for the MOL files",
+                                                  initialdir=self.last_directory)
+                if not folder:
+                    return
+                self._remember_directory(folder)
+
+                saved_count = 0
+                failed_sources = []
+                used_filenames = set()
+                for r in usable:
+                    try:
+                        molblock = self.mol_converter.smiles_to_molblock(
+                            r["smiles"], title=r["source"])
+                    except Exception:
+                        failed_sources.append(r["source"])
+                        continue
+                    base = sanitize_filename(r["source"])
+                    filename = f"{base}.mol"
+                    counter = 2
+                    while filename in used_filenames:
+                        filename = f"{base}_{counter}.mol"
+                        counter += 1
+                    used_filenames.add(filename)
+                    try:
+                        with open(os.path.join(folder, filename), "w", encoding="utf-8") as f:
+                            f.write(molblock)
+                        saved_count += 1
+                    except Exception:
+                        failed_sources.append(r["source"])
+
+                note = f"{saved_count} structure(s) saved to:\n{folder}"
+                if failed_sources:
+                    note += f"\n\n{len(failed_sources)} could not be converted and were skipped."
+                messagebox.showinfo("Saved", note)
+
+        self._ensure_rdkit_then(proceed, self.image_status_label, self.image_progress)
 
     def on_save_image_csv(self):
         """Exports every recognized image result this session as a
@@ -1685,9 +3594,11 @@ class OpsinatorApp:
             defaultextension=".csv",
             filetypes=[("CSV files", "*.csv")],
             initialfile="decimer_results.csv",
+            initialdir=self.last_directory,
         )
         if not path:
             return
+        self._remember_directory(path)
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=["source", "smiles"])
@@ -1705,40 +3616,178 @@ class OpsinatorApp:
             messagebox.showwarning("Nothing to export", "No recognized structures to export.")
             return
 
-        self.mol_converter.ensure_loaded()
-        if self.mol_converter.load_error:
-            messagebox.showerror("Chemistry toolkit unavailable",
-                                  f"Could not load RDKit: {self.mol_converter.load_error}")
-            return
+        def proceed():
+            records = []
+            for r in usable:
+                try:
+                    molblock = self.mol_converter.smiles_to_molblock(r["smiles"], title=r["source"])
+                    records.append((molblock, {"Source image": r["source"]}))
+                except Exception:
+                    continue  # CONCEPT: `continue` skips straight to the next loop iteration
 
-        records = []
-        for r in usable:
+            if not records:
+                messagebox.showwarning("Nothing to export",
+                                        "None of the predicted SMILES could be converted to a structure.")
+                return
+
+            path = filedialog.asksaveasfilename(
+                defaultextension=".sdf",
+                filetypes=[("SDF files", "*.sdf")],
+                initialfile="decimer_results.sdf",
+                initialdir=self.last_directory,
+            )
+            if not path:
+                return
+            self._remember_directory(path)
             try:
-                molblock = self.mol_converter.smiles_to_molblock(r["smiles"], title=r["source"])
-                records.append((molblock, {"Source image": r["source"]}))
-            except Exception:
-                continue  # CONCEPT: `continue` skips straight to the next loop iteration
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(build_sdf(records))
+                skipped = len(usable) - len(records)
+                note = f"{len(records)} structure(s) saved to:\n{path}"
+                if skipped:
+                    note += f"\n\n{skipped} could not be converted and were skipped."
+                messagebox.showinfo("Saved", note)
+            except Exception as e:
+                messagebox.showerror("Error saving file", str(e))
 
-        if not records:
-            messagebox.showwarning("Nothing to export",
-                                    "None of the predicted SMILES could be converted to a structure.")
-            return
+        self._ensure_rdkit_then(proceed, self.image_status_label, self.image_progress)
 
-        path = filedialog.asksaveasfilename(
-            defaultextension=".sdf",
-            filetypes=[("SDF files", "*.sdf")],
-            initialfile="decimer_results.sdf",
+    # ---------------- patent activity tab handlers ----------------
+
+    def on_activity_load(self):
+        path = filedialog.askopenfilename(
+            title="Select patent PDF",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+            initialdir=getattr(self, "last_directory", None) or os.path.expanduser("~"),
         )
         if not path:
             return
+        self._remember_directory(path)
+        self._activity_pdf_path = path
+        self.activity_pdf_label.config(text=f"PDF: {os.path.basename(path)}")
+        self.activity_run_btn.config(state="normal")
+        self.activity_status_label.config(text="Ready — click Extract & Convert.")
+
+    def on_activity_run(self):
+        if not self._activity_pdf_path:
+            return
+        self.activity_tree.delete(*self.activity_tree.get_children())
+        self._activity_results = []
+        self.activity_save_btn.config(state="disabled")
+        self.activity_load_btn.config(state="disabled")
+        self.activity_run_btn.config(state="disabled")
+        self.activity_status_label.config(text="Parsing PDF…")
+        self.activity_progress.config(mode="indeterminate", value=0)
+        self.activity_progress.start(10)
+        self._activity_queue = queue.Queue()
+        threading.Thread(
+            target=self._run_activity_extraction,
+            args=(self._activity_pdf_path,),
+            daemon=True,
+        ).start()
+        self._poll_activity_queue()
+
+    def _run_activity_extraction(self, pdf_path):
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(build_sdf(records))
-            skipped = len(usable) - len(records)
-            note = f"{len(records)} structure(s) saved to:\n{path}"
-            if skipped:
-                note += f"\n\n{skipped} could not be converted and were skipped."
-            messagebox.showinfo("Saved", note)
+            rows = parse_activity_table(pdf_path)
+            if not rows:
+                self._activity_queue.put(("error", "No activity table found in PDF."))
+                return
+            self._activity_queue.put(("parsed", len(rows)))
+            for i, row in enumerate(rows, start=1):
+                result = fetch_opsin(row["clean_name"])
+                row["smiles"]  = result.get("smiles", "")
+                row["status"]  = result.get("status", "ERROR")
+                row["message"] = result.get("message", "")
+                self._activity_queue.put(("row", i, len(rows), row))
+            self._activity_queue.put(("done", len(rows)))
+        except Exception as e:
+            self._activity_queue.put(("error", str(e)))
+
+    def _poll_activity_queue(self):
+        try:
+            while True:
+                msg = self._activity_queue.get_nowait()
+                kind = msg[0]
+                if kind == "parsed":
+                    n = msg[1]
+                    self.activity_status_label.config(
+                        text=f"Parsed {n} entries — converting names via OPSIN…")
+                    self.activity_progress.stop()
+                    self.activity_progress.config(mode="determinate", maximum=n, value=0)
+                elif kind == "row":
+                    _, i, total, row = msg
+                    self._activity_results.append(row)
+                    ex_label = f"{row['example']}{row.get('example_suffix', '')}"
+                    smiles_display = (row["smiles"]
+                                      if row["smiles"]
+                                      else f"({row['message'][:40]})")
+                    self.activity_tree.insert("", "end", values=(
+                        ex_label,
+                        row["clean_name"],
+                        row["ic50"],
+                        smiles_display,
+                        row["status"],
+                        row["page"],
+                    ))
+                    self.activity_tree.yview_moveto(1.0)
+                    self.activity_progress.config(value=i)
+                    self.activity_status_label.config(
+                        text=f"Converting… {i}/{total}  (Example {ex_label})")
+                elif kind == "done":
+                    total = msg[1]
+                    ok   = sum(1 for r in self._activity_results if r["smiles"])
+                    fail = total - ok
+                    self.activity_status_label.config(
+                        text=f"Done: {total} entries — {ok} SMILES resolved, {fail} failed.")
+                    self.activity_progress.config(value=total)
+                    self.activity_load_btn.config(state="normal")
+                    self.activity_run_btn.config(state="normal")
+                    if self._activity_results:
+                        self.activity_save_btn.config(state="normal")
+                    return
+                elif kind == "error":
+                    messagebox.showerror("Extraction error", msg[1])
+                    self.activity_progress.stop()
+                    self.activity_progress.config(mode="determinate", value=0)
+                    self.activity_load_btn.config(state="normal")
+                    self.activity_run_btn.config(state="normal")
+                    return
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_activity_queue)
+
+    def on_activity_save_csv(self):
+        if not self._activity_results:
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")],
+            initialfile="patent_activity.csv",
+            initialdir=getattr(self, "last_directory", None) or os.path.expanduser("~"),
+        )
+        if not path:
+            return
+        self._remember_directory(path)
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "Example #", "Compound Name (OPSIN input)", "Raw Name (PDF extracted)",
+                    "IC50 (nM)", "n Replicates",
+                    "SMILES", "Status", "Message", "Source Page",
+                    "Salt Form", "Stereo Note", "Handling Notes",
+                ])
+                for r in self._activity_results:
+                    ex_label = f"{r['example']}{r.get('example_suffix', '')}"
+                    notes    = "; ".join(r.get("handling_notes", []))
+                    writer.writerow([
+                        ex_label, r["clean_name"], r["name"], r["ic50"], r.get("rep", ""),
+                        r["smiles"], r["status"], r["message"], r["page"],
+                        r.get("salt_form", ""), r.get("stereo_note", ""), notes,
+                    ])
+            messagebox.showinfo("Saved",
+                                f"{len(self._activity_results)} rows saved to:\n{path}")
         except Exception as e:
             messagebox.showerror("Error saving file", str(e))
 
@@ -1753,7 +3802,11 @@ def main():
     automatically launching the GUI - the GUI only starts if this file is
     run directly.
     """
-    root = tk.Tk()        # creates the actual operating-system window
+    # TkinterDnD.Tk() is a drop-in replacement for tk.Tk() that adds
+    # drag-and-drop capability to the whole window. If the package
+    # isn't available, plain tk.Tk() works exactly as it always has -
+    # the only difference is the drop zone won't accept drags.
+    root = TkinterDnD.Tk() if _DND_AVAILABLE else tk.Tk()
     root.withdraw()        # ...but hide it immediately, until the license is accepted
 
     def launch_app():
